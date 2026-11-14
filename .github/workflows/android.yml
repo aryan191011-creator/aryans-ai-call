@@ -29,9 +29,6 @@ concurrency:
   group: android-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  ANDROID_HOME: ${{ github.workspace }}/android-sdk
-
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -44,13 +41,22 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # Gradle is preinstalled on the runner image, and the wrapper jar is deliberately not in
-      # the repo (a 43KB binary that downloads a distribution, in a tree nobody audits). So:
-      # invoke `gradle` directly. If you want ./gradlew locally, run `gradle wrapper` once.
+      # Gradle is pinned rather than inherited. The runner image ships one, and which version
+      # that is changes without this repo doing anything — an image bump to a Gradle that AGP
+      # 8.1 cannot configure is a build that fails in 40 seconds with a message about
+      # `Convention`, and it looks like our fault. Also: no wrapper jar is committed, so
+      # there is nothing here for the image to disagree with.
+      - name: Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.5'
+          # AGP 8.1's own floor is 8.0; 8.5 is the line it is regularly tested against.
+
       - name: Localise the toolchain
         run: |
           java -version
           gradle --version | sed -n '1,8p'
+          echo "ANDROID_HOME=$ANDROID_HOME"
 
       - name: Static APK checks (no compiler here can catch these)
         run: node scripts/check-apk.mjs
@@ -75,7 +81,35 @@ jobs:
           # Only two things are needed to make a release build reproducible: no daemon left
           # holding state, and no surprise from a Gradle property someone set in their shell.
           GRADLE_OPTS: -Dorg.gradle.daemon=false
-        run: gradle --no-daemon :app:assembleRelease :app:assembleDebug
+        # `tee` because the next step needs the text. `|| true` so a failed build reaches that
+        # step instead of ending the job at the failing line.
+        run: |
+          set -o pipefail
+          gradle --no-daemon --stacktrace :app:assembleRelease :app:assembleDebug 2>&1 \
+            | tee /tmp/gradle.log || echo "BUILD_FAILED=1" >> "$GITHUB_ENV"
+
+      - name: Report the failure where it can be read
+        # This sandbox cannot download Actions logs at all — the log host is not reachable from
+        # it, so `gh run view --log-failed` returns an EOF and a red X tells you nothing about
+        # why. Posting the interesting lines as a comment on the commit routes the same
+        # information through api.github.com, which is reachable, and it is where a reader of
+        # the commit would look anyway. Only ever posted on a failure.
+        if: env.BUILD_FAILED == '1'
+        run: |
+          grep -E -A4 "^\* What went wrong|FAILURE:|error:|Execution failed" /tmp/gradle.log \
+            | tail -100 > /tmp/tail.txt
+          printf '%s\n' "### android build failed on ${{ github.sha }}" > /tmp/body.txt
+          printf '\n```\n' >> /tmp/body.txt
+          tail -60 /tmp/tail.txt >> /tmp/body.txt
+          printf '\n```\n' >> /tmp/body.txt
+          gh api -X POST "repos/{owner}/{repo}/commits/${{ github.sha }}/comments" \
+            -F body=@/tmp/body.txt
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Fail the step if the build did
+        if: env.BUILD_FAILED == '1'
+        run: exit 1
 
       - name: What is actually in the APK
         # Unbundles the release artifact and checks the staged page survived aapt's path
