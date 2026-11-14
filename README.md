@@ -335,12 +335,24 @@ adb install app-release.apk        # or just open the Release page and tap the .
   in the repo — a 43 KB binary whose only job is to download a distribution is a supply-chain
   surface nobody reviews. Run `gradle wrapper` once if you want `./gradlew`.
 
-`scripts/check-apk.mjs` is the closest thing to a test suite the wrapper can have here: 24
+`scripts/check-apk.mjs` is the closest thing to a test suite the wrapper can have here: 29
 checks over manifest, Java, Gradle, theme, generated icons and the workflow, aimed at the
-failures a compiler cannot see. Both of the interesting ones were found by writing it — the
-page asks for `/styles.css` at the *root*, which a `/web/*`-only handler 404s into a black
-screen with a 200 on the document and nothing in the console. Every check is mutation-tested:
-33 one-line edits that each represent a real mistake, and each must turn the suite red.
+failures a compiler cannot see. Two real ones fell out of writing it: the page asks for
+`/styles.css` at the *root*, which a `/web/*`-only handler 404s into a black screen with a 200
+on the document and nothing in the console; and the `String[]`-vs-`int[]` shape of
+`PermissionRequest`, which the compiler caught later and only in CI. Every check is
+mutation-tested — 38 one-line edits that each represent a real mistake, each required to turn
+the suite red, and four of the checks passed for the wrong reason until they were tightened: a
+word matched inside a comment (`// assets.srcDir genAssets` is not the assets path being wired),
+the *debug* build type's signing line standing in for the release one, a command on the line
+after `run: |` that a `run:…gradlew` regex could never see, and `Sync` matching prose instead of
+the task declaration. The boot suite's dialog checks had the two nastier ones: an assertion whose
+filter excluded the same `<script>` node the app excludes, which cannot tell a correct set from
+an empty one, and `app.slice(start, 220)` — the first 220 bytes of the *file*, not of the
+snippet — which would have passed whatever the Escape branch did. The harness that runs the
+mutations restores every file on every exit path, including the early ones, because a sweep that
+leaves the tree dirty is indistinguishable from a regression in the code under test; it did that
+to a fix once, and the fix had to be re-derived.
 
 ## The phone leg — read before you plan around it
 
@@ -374,3 +386,12 @@ answers the mobile over HFP.
    hands-free profile first.
 4. **Hinglish ASR tuning.** If we fall back to cascade, `whisper-small` fine-tuned for Hindi
    beats the big general models on code-mixed speech at this audio quality.
+5. **A foreground `microphone` service, for the APK.** Locking the screen stops the call,
+   because a WebView lives and dies with its Activity. The fix is a service that holds the
+   notification and outlives the backgrounding, plus a policy for what happens to a session
+   whose page is gone — which is the part that needs thinking, not the part that needs code.
+6. **The phone pass the APK still needs.** Everything provable without a hand on a device is
+   proved: the build, the signature, `aapt2` saying `RECORD_AUDIO` and the right `versionName`,
+   the bundled page inside the archive. Nobody has yet tapped the green button on a real phone
+   and watched `onPermissionRequest` decide the whole app. Start there, with
+   `chrome://inspect` on a debug build.
