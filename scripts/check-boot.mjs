@@ -510,6 +510,39 @@ check('the stepper stops at both ends instead of looping', () => {
   reg.get('panelNext').fire('click');
   assert.equal(reg.get('p-phone').hidden, false, 'stepping past the end moved anyway');
 });
+check('no control carries two accessible names', () => {
+  // A `<label for=x>` and an `aria-label` on #x is not belt-and-braces: the ARIA name wins and
+  // the label element becomes decoration that will drift. One name per control, from one place.
+  const dupes = [];
+  for (const m of html.matchAll(/<label\b[^>]*\bfor="([^"]+)"/g)) {
+    const id = m[1];
+    const tag = new RegExp(`<\\w+[^>]*id="${id}"[^>]*>`).exec(html);
+    if (tag && /aria-label=/.test(tag[0])) dupes.push(id);
+  }
+  assert.deepEqual(dupes, [], 'labelled twice (aria-label silently wins): ' + dupes.join(', '));
+  // A placeholder is not a name: anything that relies on one is unlabelled. Both label
+  // mechanisms count — every field here is *wrapped* in `<label class="field">` (implicit
+  // labelling, no `for`), and a scan that only understands `for=` reports the whole form as
+  // nameless, which is how this check read when it was first written.
+  const implicit = new Set();
+  for (const m of html.matchAll(/<label\b[^>]*>([\s\S]*?)<\/label>/g)) {
+    for (const idm of m[1].matchAll(/\bid="([^"]+)"/g)) implicit.add(idm[1]);
+  }
+  const nameless = [];
+  for (const m of html.matchAll(/<(input|select|textarea)\b([^>]*\bid="([^"]+)"[^>]*)>/g)) {
+    const id = m[3];
+    // `[^>"]for=` rather than `\bfor=`: inside a *string* passed to RegExp, `\b` is the backspace
+    // escape, not a word boundary, so the pattern looks right in the source and matches nothing.
+    // It cost this check every `<label for>` in the file — reported as "no accessible name" for
+    // the one control that had one, which is the kind of failure that gets "fixed" by editing
+    // the markup instead of the regex.
+    const labelled = new RegExp(`<label[^>]*[^>"]for="${id}"`).test(html) || implicit.has(id)
+      || /aria-label=|aria-labelledby=/.test(m[2]);
+    if (!labelled) nameless.push(id);
+  }
+  assert.deepEqual(nameless, [], 'form controls with no accessible name: ' + nameless.join(', '));
+});
+
 check('nothing you can press lives inside a <label>', () => {
   // A button or a link nested in a <label> belongs to the labelled control: clicking it
   // focuses (and for a checkbox, toggles) that control, so "restore the built-in defaults"

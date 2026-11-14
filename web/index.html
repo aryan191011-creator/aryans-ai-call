@@ -86,10 +86,13 @@
   </div>
 
   <form class="composer" id="textForm">
-    <label class="sr-only" for="textInput">Send a message to the agent instead of speaking</label>
+    <!-- One accessible name, on the label. A placeholder is not a label (it vanishes on input,
+         and is contrast-suspect), and adding aria-label here would silently override this
+         sentence for a screen reader while leaving the label element decorative. The placeholder
+         stays short because a 360px screen cuts it mid-phrase — the screenshot's other defect. -->
+    <label class="sr-only" for="textInput">Type instead of speaking — the agent answers out loud</label>
     <input id="textInput" type="text" autocomplete="off" maxlength="500"
-           placeholder="Type instead — it answers aloud"
-           aria-label="Type instead — the agent answers out loud" />
+           placeholder="Type instead — it answers aloud" />
     <button class="send" type="submit" aria-label="Send message">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 12 16-8-6 8 6 8-16-8Z"/></svg>
     </button>
