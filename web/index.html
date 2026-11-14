@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>aryans-ai-call — Hinglish voice agent</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="dot" id="statusDot"></span>
+    <h1>aryans<span>-ai-call</span></h1>
+  </div>
+  <div class="head-right">
+    <span class="pill" id="modePill">idle</span>
+    <button id="gearBtn" class="ghost" title="Settings">⚙</button>
+  </div>
+</header>
+
+<main>
+  <!-- ── the orb: single source of truth for state ─────────────────── -->
+  <section class="stage">
+    <div class="orb-wrap">
+      <div class="orb" id="orb" data-state="idle">
+        <div class="ring r1"></div>
+        <div class="ring r2"></div>
+        <div class="core"><span id="coreGlyph">🎙</span></div>
+      </div>
+      <p class="say" id="say">Tap the mic to start talking. Hinglish chalega.</p>
+    </div>
+  </section>
+
+  <!-- ── transcript ───────────────────────────────────────────────── -->
+  <section class="thread" id="thread" aria-live="polite">
+    <div class="empty" id="emptyNote">
+      No call yet. Every turn you speak lands here with its latency, so you can
+      see exactly where the seconds go.
+    </div>
+  </section>
+</main>
+
+<!-- ── meter bar: turn latency + levels, always visible ───────────── -->
+<footer>
+  <div class="meter">
+    <div class="lvl"><span>in</span><i><b id="inBar"></b></i></div>
+    <div class="lvl"><span>out</span><i><b id="outBar"></b></i></div>
+  </div>
+  <div class="stats">
+    <span title="turn latency: your silence → first audio back">turn <b id="sTurnLat">–</b></span>
+    <span title="audio received this call">recv <b id="sRecv">0.0s</b></span>
+    <span title="tokens/day on the free tier is the real limit">calls <b id="sCalls">0</b></span>
+  </div>
+  <div class="dock">
+    <button id="hangup" class="danger" hidden>End call</button>
+    <button id="pushToTalk" class="ptt" hidden>Hold to talk</button>
+    <button id="pttBtn" class="big" aria-label="Start voice session">●</button>
+  </div>
+</footer>
+
+<!-- ── settings sheet ─────────────────────────────────────────────── -->
+<div class="sheet" id="sheet" hidden>
+  <div class="sheet-card">
+    <h2>Setup <small>₹0 — free tiers only</small></h2>
+
+    <label class="field">
+      <span>Gemini API key <em>free, no card</em> — <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer">aistudio.google.com/apikey</a></span>
+      <input id="fKey" type="password" autocomplete="off" spellcheck="false" placeholder="AIza…" />
+    </label>
+
+    <label class="field">
+      <span>Model</span>
+      <input id="fModel" list="modelList" value="models/gemini-2.5-flash-native-audio-preview-12-2025" />
+      <datalist id="modelList">
+        <option value="models/gemini-2.5-flash-native-audio-preview-12-2025"></option>
+        <option value="models/gemini-live-2.5-flash-native-audio"></option>
+        <option value="models/gemini-3.1-flash-live-preview"></option>
+      </datalist>
+      <small>Free-tier rows move around. If setup fails with <code>404/NOT_FOUND</code>, pick another row here — that is a naming problem, not a you-problem.</small>
+    </label>
+
+    <div class="row">
+      <label class="field half">
+        <span>Voice</span>
+        <select id="fVoice">
+          <option>Kore</option><option>Puck</option><option>Charon</option>
+          <option>Fenrir</option><option>Aoede</option><option>Orus</option>
+          <option>Zephyr</option><option>Autonoe</option>
+        </select>
+      </label>
+      <label class="field half">
+        <span>Turn detection</span>
+        <select id="fVad">
+          <option value="server">Server VAD (hands-free)</option>
+          <option value="ptt">Push to talk (my own VAD)</option>
+        </select>
+      </label>
+    </div>
+
+    <label class="field">
+      <span>Persona</span>
+      <textarea id="fPrompt" rows="7" spellcheck="false"></textarea>
+      <small>Rules baked in for phone audio: short turns, <b>one</b> question at a time, and
+      every number/date/name gets echoed back digit by digit. 8 kHz voices lie to models.</small>
+    </label>
+
+    <label class="check">
+      <input id="fGuard" type="checkbox" checked />
+      <span>Half-duplex guard — stop sending my mic while the agent talks. Essential on laptop speakers; untick with headphones for true interruption.</span>
+    </label>
+
+    <p class="keywarn" id="keyWarn">
+      Key lives in <code>localStorage</code> on this device and goes straight to Google.
+      Anyone with this machine can read it. To keep it on a server instead:
+      <code>PROXY=1 GEMINI_API_KEY=… npm i ws &amp;&amp; npm start</code>.
+    </p>
+
+    <div class="sheet-actions">
+      <button id="sheetSave" class="primary">Save</button>
+      <button id="sheetTest" class="ghost">Test connection</button>
+      <button id="sheetClose" class="ghost">Close</button>
+    </div>
+    <pre id="sheetLog" class="log" hidden></pre>
+  </div>
+</div>
+
+<script src="/app.js" type="module"></script>
+</body>
+</html>

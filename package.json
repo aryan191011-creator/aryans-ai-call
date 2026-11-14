@@ -1,0 +1,15 @@
+{
+  "name": "aryans-ai-call",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Hinglish realtime voice assistant. Zero-budget: Gemini Live free tier, no build step, no runtime deps.",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node server.mjs"
+  },
+  "optionalDependencies": {
+    "ws": "^8.18.0"
+  }
+}
