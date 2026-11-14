@@ -3,65 +3,133 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<title>aryans-ai-call — Hinglish voice agent</title>
+<meta name="color-scheme" content="dark light" />
+<meta name="theme-color" content="#08090d" media="(prefers-color-scheme: dark)" />
+<meta name="theme-color" content="#f7f8fb" media="(prefers-color-scheme: light)" />
+<meta name="description" content="Hinglish realtime voice assistant. Zero budget, browser-native." />
+<title>Aryans AI Call — voice agent</title>
 <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-<header>
+<a class="skip" href="#composer">Skip to controls</a>
+
+<header class="bar">
   <div class="brand">
-    <span class="dot" id="statusDot"></span>
-    <h1>aryans<span>-ai-call</span></h1>
+    <svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a3 3 0 0 1 3 3v5a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3Z"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+    <span class="name">Aryans <em>AI&nbsp;Call</em></span>
   </div>
-  <div class="head-right">
-    <span class="pill" id="modePill">idle</span>
-    <button id="gearBtn" class="ghost" title="Settings">⚙</button>
-  </div>
+
+  <!-- State is carried by icon + text, never colour alone (WCAG "use of color"). -->
+  <p class="state" id="stateChip">
+    <span class="state-icon" id="coreGlyph" aria-hidden="true">🎙</span>
+    <span id="modePill">idle</span>
+  </p>
+
+  <button id="gearBtn" class="icon-btn" aria-haspopup="dialog" aria-expanded="false" aria-controls="sheet" aria-label="Settings">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3M5 5l2 2m10 10 2 2M19 5l-2 2M7 17l-2 2"/></svg>
+  </button>
 </header>
 
+<!-- Announces state changes to AT. It MUST exist before the first update: a live
+     region inserted together with its text is silent. SC 4.1.3. -->
+<p class="sr-only" id="a11yStatus" role="status" aria-live="polite"></p>
+
 <main>
-  <!-- ── the orb: single source of truth for state ─────────────────── -->
-  <section class="stage">
-    <div class="orb-wrap">
-      <div class="orb" id="orb" data-state="idle">
-        <div class="ring r1"></div>
-        <div class="ring r2"></div>
-        <div class="core"><span id="coreGlyph">🎙</span></div>
-      </div>
-      <p class="say" id="say">Tap the mic to start talking. Hinglish chalega.</p>
+  <section class="stage" aria-label="Call status">
+    <div class="orb" id="orb" data-state="idle">
+      <span class="halo h1" aria-hidden="true"></span>
+      <span class="halo h2" aria-hidden="true"></span>
+      <span class="halo h3" aria-hidden="true"></span>
+      <span class="core" aria-hidden="true">
+        <span class="bars"><i></i><i></i><i></i><i></i><i></i></span>
+      </span>
+    </div>
+
+    <p class="say" id="say" role="status" aria-live="polite">
+      Tap <b>Start</b> to talk. Hinglish chalega.
+    </p>
+
+    <!-- Perceived-latency is the whole quality signal on voice: "voice has no
+         spinner". Shown as a live bar, plus the number, so it is auditable. -->
+    <div class="lat" id="latBar" hidden>
+      <i id="latFill"></i>
+      <span id="latHint">thinking</span>
     </div>
   </section>
 
-  <!-- ── transcript ───────────────────────────────────────────────── -->
-  <section class="thread" id="thread" aria-live="polite">
-    <div class="empty" id="emptyNote">
-      No call yet. Every turn you speak lands here with its latency, so you can
-      see exactly where the seconds go.
+  <!-- role=log + polite: appends announce without stealing focus (SC for chat). -->
+  <section class="thread-wrap">
+    <div class="thread" id="thread" role="log" aria-label="Call transcript" aria-live="polite" tabindex="0">
+      <ul class="seed" id="emptyNote">
+        <li><b>Order ka status poochho</b> — “mera order 4471 kahaan hai?”</li>
+        <li><b>Wapas call maangne bolo</b> — “kal subah 9 baje call karna”</li>
+        <li><b>Koi bhi baat</b> — the agent reads every number back before trusting it</li>
+      </ul>
     </div>
+    <button class="jump" id="jumpLatest" hidden>
+      New reply <span aria-hidden="true">↓</span>
+    </button>
   </section>
 </main>
 
-<!-- ── meter bar: turn latency + levels, always visible ───────────── -->
-<footer>
-  <div class="meter">
-    <div class="lvl"><span>in</span><i><b id="inBar"></b></i></div>
-    <div class="lvl"><span>out</span><i><b id="outBar"></b></i></div>
+<footer class="dock" id="composer">
+  <div class="meters" aria-hidden="true">
+    <span class="lvl"><span class="tag">you</span><i><b id="inBar"></b></i></span>
+    <span class="lvl"><span class="tag">ai</span><i><b id="outBar"></b></i></span>
+    <span class="counts">
+      <span title="Silence → first agent audio (what the caller actually feels)">turn <b id="sTurnLat">–</b></span>
+      <span title="p50/p95 across this session">spread <b id="sSpread">–</b></span>
+      <span title="audio played this session">audio <b id="sRecv">0.0s</b></span>
+      <span title="sessions started; free tier counts requests per day">calls <b id="sCalls">0</b></span>
+    </span>
   </div>
-  <div class="stats">
-    <span title="turn latency: your silence → first audio back">turn <b id="sTurnLat">–</b></span>
-    <span title="audio received this call">recv <b id="sRecv">0.0s</b></span>
-    <span title="tokens/day on the free tier is the real limit">calls <b id="sCalls">0</b></span>
+
+  <form class="composer" id="textForm">
+    <label class="sr-only" for="textInput">Send a message to the agent instead of speaking</label>
+    <input id="textInput" type="text" autocomplete="off" maxlength="500"
+           placeholder="Type instead — the agent answers out loud" />
+    <button class="send" type="submit" aria-label="Send message">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 12 16-8-6 8 6 8-16-8Z"/></svg>
+    </button>
+  </form>
+
+  <div class="controls">
+    <button id="muteBtn" class="icon-btn" aria-pressed="false" aria-label="Mute microphone" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a3 3 0 0 1 3 3v5a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3Z"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3M4 4l16 16"/></svg>
+      <span class="lbl">Mute</span>
+    </button>
+
+    <!-- APG toggle button: aria-pressed carries the listening state, so it is
+         announced. A pulsing background alone would be invisible to AT. -->
+    <button id="pttBtn" class="push" aria-pressed="false">
+      <span class="glyph" aria-hidden="true">🎙</span>
+      <span id="pttLabel">Start</span>
+    </button>
+
+    <button id="pushToTalk" class="icon-btn ptt" hidden>
+      <span class="lbl" aria-hidden="true">Hold to talk</span>
+      <span class="sr-only">Hold to speak, release to send</span>
+    </button>
+
+    <button id="hangup" class="end" hidden>
+      <span class="glyph" aria-hidden="true">⏹</span> End call
+    </button>
   </div>
-  <div class="dock">
-    <button id="hangup" class="danger" hidden>End call</button>
-    <button id="pushToTalk" class="ptt" hidden>Hold to talk</button>
-    <button id="pttBtn" class="big" aria-label="Start voice session">●</button>
+
+  <p class="hint" id="hint">
+    <button class="linklike" id="bargeInfo" aria-expanded="false" aria-controls="bargeHelp">How interruption works</button>
+  </p>
+  <div class="fold" id="bargeHelp" hidden>
+    <p>Speak while it talks and it stops. Small backchannels — <i>haan, okay, mhm</i> —
+    only <b>duck</b> the volume; a real interrupt like <i>ruko</i> or <i>wait</i>
+    <b>cuts</b> it. <kbd>Esc</kbd> always cuts.</p>
   </div>
 </footer>
 
-<!-- ── settings sheet ─────────────────────────────────────────────── -->
+<!-- ── settings sheet ─────────────────────────────────────────────────── -->
 <div class="sheet" id="sheet" hidden>
-  <div class="sheet-card">
-    <h2>Setup <small>₹0 — free tiers only</small></h2>
+  <div class="sheet-card" role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
+    <h2 id="sheetTitle">Setup <small>₹0 — free tiers only</small></h2>
 
     <label class="field">
       <span>Gemini API key <em>free, no card</em> — <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer">aistudio.google.com/apikey</a></span>
@@ -76,7 +144,7 @@
         <option value="models/gemini-live-2.5-flash-native-audio"></option>
         <option value="models/gemini-3.1-flash-live-preview"></option>
       </datalist>
-      <small>Free-tier rows move around. If setup fails with <code>404/NOT_FOUND</code>, pick another row here — that is a naming problem, not a you-problem.</small>
+      <small>Free-tier rows move. On <code>NOT_FOUND</code>, pick another — that is a naming problem, not a you-problem.</small>
     </label>
 
     <div class="row">
@@ -97,22 +165,51 @@
       </label>
     </div>
 
+    <label class="check">
+      <input id="fGuard" type="checkbox" checked />
+      <span>Half-duplex guard — stop sending my mic while the agent talks. Essential on
+      laptop speakers; untick with headphones for true interruption.</span>
+    </label>
+
+    <fieldset class="a11y">
+      <legend>Accessibility <span>persisted on this device</span></legend>
+      <label class="field third">
+        <span>Motion</span>
+        <select id="fMotion">
+          <option value="system">System (prefers-reduced-motion)</option>
+          <option value="reduce">Reduce</option>
+          <option value="no-preference">Full</option>
+        </select>
+      </label>
+      <label class="field third">
+        <span>Contrast</span>
+        <select id="fContrast">
+          <option value="system">System</option>
+          <option value="more">High</option>
+        </select>
+      </label>
+      <label class="field third">
+        <span>Text size</span>
+        <select id="fScale">
+          <option value="1">Default</option>
+          <option value="1.15">Large</option>
+          <option value="1.3">Largest</option>
+        </select>
+      </label>
+      <label class="check">
+        <input id="fCues" type="checkbox" checked />
+        <span>Earcons — 120 ms blips on mic open/close. Kept under 150 ms so they never mask the first phoneme.</span>
+      </label>
+    </fieldset>
+
     <label class="field">
       <span>Persona</span>
       <textarea id="fPrompt" rows="7" spellcheck="false"></textarea>
-      <small>Rules baked in for phone audio: short turns, <b>one</b> question at a time, and
-      every number/date/name gets echoed back digit by digit. 8 kHz voices lie to models.</small>
-    </label>
-
-    <label class="check">
-      <input id="fGuard" type="checkbox" checked />
-      <span>Half-duplex guard — stop sending my mic while the agent talks. Essential on laptop speakers; untick with headphones for true interruption.</span>
     </label>
 
     <p class="keywarn" id="keyWarn">
       Key lives in <code>localStorage</code> on this device and goes straight to Google.
-      Anyone with this machine can read it. To keep it on a server instead:
-      <code>PROXY=1 GEMINI_API_KEY=… npm i ws &amp;&amp; npm start</code>.
+      Server-side instead: <code>PROXY=1 GEMINI_API_KEY=… npm i ws &amp;&amp; npm start</code>.
     </p>
 
     <div class="sheet-actions">

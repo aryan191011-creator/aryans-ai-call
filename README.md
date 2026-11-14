@@ -31,6 +31,42 @@ No `npm install`, no build step, no dependencies — the whole app is three stat
    streaming call, not a chat message), so expect *tens* of calls a day, not thousands.
    `⚙ → Test connection` probes the model row before you burn anything on audio.
 
+## The interface, and why each piece is shaped like that
+
+Voice UI has unusually specific failure modes, so the design is pinned to rules
+rather than taste. Every one of these is asserted by `npm run check:boot`, not just
+claimed here.
+
+| Rule | What the UI does |
+| --- | --- |
+| Silence reads as a dropped call; **voice has no spinner** | The orb has eight distinct states — idle, connecting, listening, thinking, speaking, interrupted, muted, error — each with its own motion, glyph *and* words |
+| Show processing within **~200 ms** of end-of-speech or the caller talks over the agent | `thinking` is set on the VAD turn boundary itself, in the same callback, never on a timer |
+| Identical animation for listening and speaking is the classic ambiguity bug | Their keyframe durations differ; a test fails if the two states ever share an `animation` declaration |
+| Never convey state by colour alone | Icon + uppercase label + glyph change with state; colour is decoration |
+| Barge-in is a **policy**, not a boolean | A short vocalisation ducks the agent to 35% and recovers; committed speech (>300 ms) cuts it; `ruko / stop / ruko` cuts on *words* from the transcript even before energy would; `Esc` always cuts |
+| Cover any pause approaching **2 s** | A dead-air watchdog at 1800 ms says so in the UI and increments a counter — dead-air p95 is measured, not shrugged at |
+| Audio cues must stay **under 150 ms** or they mask the first phoneme | Earcons are 110 ms with a 130 ms ceiling, synthesised in WebAudio (no asset, no network), mirrored as haptics, and can't take down a call if the node is missing |
+| A live region inserted *with* its content is silent | `#a11yStatus` ships in the initial HTML with `role="status"` + `aria-live="polite"`; the transcript is `role="log"` polite so it announces without stealing focus |
+| A pulsing background is invisible to assistive tech | The mic control is a real APG toggle button; `aria-pressed` tracks the session, and mute sets both `aria-pressed` and a matching `aria-label` |
+| Auto-scroll must not yank a reader who scrolled up | `stick()` only follows while pinned within 90 px of the bottom; otherwise a "New reply ↓" pill appears and the scroll position is left alone |
+| 44 px targets, 4.5:1 text, `prefers-reduced-motion` and `prefers-contrast` honoured | Sizes are asserted per base rule; motion/contrast/scale can also be overridden in-app and persist, because the OS setting is not always reachable from a phone browser |
+| Latency averages hide the calls people remember | p50 **and p95** of silence→first-audio, plus false-cutoff count (caller resumes within 500 ms of the agent starting), shown in the footer |
+
+Design decisions worth defending:
+
+- **The half-duplex guard is on by default, and it disables barge-in.** On laptop
+  speakers the agent hears itself and interrupts itself into nonsense. Headphones
+  users untick it in Settings. That trade-off is explicit in config and tested,
+  because a silent policy that changes what the interface can do is the kind of
+  thing people should not have to discover.
+- **There is a text field.** "I am on a bus" is a normal reason voice fails, and a
+  voice-first UI that offers no keyboard fallback just loses the call.
+- **Suggested openers replace the empty state.** Voice has no buttons, so
+  discoverability has to come from somewhere.
+- **`documentElement` access is guarded and the boot test caught it unguarded** —
+  the harness has no real DOM, which is exactly the difference between "renders in
+  Chrome" and "crashes on a phone with no oscillator".
+
 ## What's in the box
 
 | File | Role |

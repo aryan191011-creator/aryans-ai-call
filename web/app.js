@@ -63,18 +63,50 @@ const DIRECT =
 // ─────────────────────────────────────────────────────────────── dom bits ──
 const $ = (id) => document.getElementById(id);
 const el = {
-  dot: $('statusDot'), pill: $('modePill'), orb: $('orb'), core: $('coreGlyph'),
-  say: $('say'), thread: $('thread'), empty: $('emptyNote'), inBar: $('inBar'),
-  outBar: $('outBar'), sTurnLat: $('sTurnLat'), sRecv: $('sRecv'), sCalls: $('sCalls'),
-  pttBtn: $('pttBtn'), ptt: $('pushToTalk'), hangup: $('hangup'), sheet: $('sheet'),
-  sheetLog: $('sheetLog'), keyWarn: $('keyWarn'),
+  pill: $('modePill'), orb: $('orb'), core: $('coreGlyph'), say: $('say'),
+  status: $('a11yStatus'), lat: $('latBar'), latFill: $('latFill'), latHint: $('latHint'),
+  thread: $('thread'), empty: $('emptyNote'), jump: $('jumpLatest'),
+  inBar: $('inBar'), outBar: $('outBar'), sTurnLat: $('sTurnLat'), sSpread: $('sSpread'),
+  sRecv: $('sRecv'), sCalls: $('sCalls'), pttBtn: $('pttBtn'), pttLabel: $('pttLabel'),
+  ptt: $('pushToTalk'), muteBtn: $('muteBtn'), hangup: $('hangup'), sheet: $('sheet'),
+  sheetLog: $('sheetLog'), keyWarn: $('keyWarn'), gear: $('gearBtn'),
+  textForm: $('textForm'), textInput: $('textInput'),
 };
 
-const setMode = (text, state) => {
+// State is a machine, not a colour. Every state has its own motion, its own
+// glyph and its own words, because "same animation for listening and speaking"
+// is the ambiguity that makes people talk over the agent.
+const GLYPH = {
+  idle: '🎙', connecting: '↻', listening: '🎙', thinking: '…',
+  speaking: '🔊', interrupted: '✋', muted: '🔇', error: '!',
+};
+let callState = 'idle';
+
+const setMode = (text, state, live = true) => {
+  callState = state;
   el.pill.textContent = text;
   el.orb.dataset.state = state;
-  el.dot.dataset.state = state;
+  if (el.core) el.core.textContent = GLYPH[state] || '🎙';
+  if (el.pttLabel) el.pttLabel.textContent = state === 'idle' ? 'Start' : 'End';
+  if (el.pttBtn) el.pttBtn.setAttribute('aria-pressed', state === 'idle' ? 'false' : 'true');
+  // The live region pre-exists in the DOM, so a change is actually announced.
+  if (live && el.status) el.status.textContent = `${text}.`;
 };
+
+/**
+ * Auto-scroll only while the reader is pinned to the bottom. Scrolling away
+ * from a live transcript is a deliberate act; stealing it back is the bug.
+ */
+const nearBottom = () =>
+  el.thread.scrollHeight - el.thread.scrollTop - el.thread.clientHeight < 90;
+function stick(force = false) {
+  if (force || nearBottom()) {
+    el.thread.scrollTop = el.thread.scrollHeight;
+    if (el.jump) el.jump.hidden = true;
+  } else if (el.jump) {
+    el.jump.hidden = false;
+  }
+}
 
 // A log line that does not need a whole transcript bubble.
 const note = (msg, kind = 'sys') => {
@@ -83,7 +115,7 @@ const note = (msg, kind = 'sys') => {
   d.className = `note ${kind}`;
   d.textContent = msg;
   el.thread.append(d);
-  el.thread.scrollTop = el.thread.scrollHeight;
+  stick();
 };
 
 // Transcriptions arrive incrementally, so each bubble accumulates rather than
@@ -103,7 +135,7 @@ function makeTurn(who) {
   d.append(a, t);
   el.thread.append(d);
   el.empty?.remove();
-  el.thread.scrollTop = el.thread.scrollHeight;
+  stick();
   return d;
 }
 
@@ -117,7 +149,7 @@ function appendTurn(who, text) {
     if (!ububble) ububble = makeTurn('user');
     ububble.querySelector('.tx').textContent += text;
   }
-  el.thread.scrollTop = el.thread.scrollHeight;
+  stick();
 }
 
 // ────────────────────────────────────────────────────────────── audio model ──
@@ -204,22 +236,23 @@ async function openMic() {
         stats.since = now;
       }
       stats.turnStart = 0; // still talking → no turn boundary yet
-    } else if (stats.speech && now - stats.since > 260) {
+    } else if (stats.speech && Math.max(0, now - stats.since) > 260) {
       stats.speech = false;
-      if (!stats.turnStart) stats.turnStart = now; // the clock we grade ourselves on
+      if (!stats.turnStart) {
+        stats.turnStart = now; // the clock we grade ourselves on
+        // Announce "thinking" inside ~200 ms of end-of-speech. Past that, the
+        // caller assumes the line dropped and starts again — voice has no spinner.
+        if (agentSpeaking === false && settled) beginThinking();
+      }
+      onSpeechEnd(now);
     }
     // noise floor learns downward only, so a noisy room does not lock us open
     stats.floor = Math.min(heard ? stats.floor : Math.max(stats.floor * 0.985, rms), 0.05);
 
+    if (muted) return;
     if (agentSpeaking) {
       if (cfg.guard) return; // half-duplex guard: never feed it our own speaker
-      // True barge-in. The model stops itself upstream, but it cannot un-ring
-      // these speakers — and a flush every 40 ms would stutter, so cooldown.
-      if (heard && performance.now() - (stats.lastFlush || 0) > 320) {
-        stats.lastFlush = performance.now();
-        flushPlayback();
-        setAgentSpeaking(false);
-      }
+      bargePolicy(heard, now);
     }
     const pcm = resampleTo16k(block);
     const merged = new Int16Array(pending.length + pcm.length);
@@ -280,18 +313,96 @@ function flushPlayback() {
 // ───────────────────────────────────────────────────────── the live session ──
 let ws = null;
 let agentSpeaking = false;
+let muted = false;
 let settled = false; // setupComplete seen
 let triedMinimal = false;
 let tools = {};
 
 function setAgentSpeaking(on) {
   agentSpeaking = on;
-  el.core.textContent = on ? '🔊' : '🎙';
-  setMode(on ? 'agent talking' : 'listening', on ? 'speaking' : 'listening');
+  duck(1);
   if (on) {
+    if (abubble) abubble.classList.add('pending');
+    setMode('agent talking', 'speaking');
+    el.say.textContent = 'Agent bol raha hai…';
     el.outBar.style.width = '40%';
+    endThinking();
   } else {
-    el.say.textContent = 'Boliye — I am listening.';
+    abubble?.classList.remove('pending');
+    setMode(muted ? 'muted' : 'listening', muted ? 'muted' : 'listening');
+    el.say.innerHTML = muted
+      ? 'Mic muted — tap <b>Unmute</b> to interrupt again.'
+      : 'Boliye — <b>main sun raha hoon</b>.';
+  }
+}
+
+let thinkTimer = null;
+let duckUntil = 0;
+function beginThinking() {
+  setMode('thinking', 'thinking');
+  if (el.lat) el.lat.hidden = false;
+  // Any pause approaching 2 s reads as a dead line. Say so before the caller
+  // hangs up or repeats themselves, and log it — dead-air p95 is the metric.
+  clearTimeout(thinkTimer);
+  thinkTimer = setTimeout(() => {
+    if (callState === 'thinking') {
+      if (el.latHint) el.latHint.textContent = 'still thinking';
+      stats.deadair = (stats.deadair || 0) + 1;
+      note('agent is slow this turn — dead air is a bug we count, not hide', 'sys');
+    }
+  }, 1800);
+}
+function endThinking() {
+  clearTimeout(thinkTimer);
+  if (el.lat) el.lat.hidden = true;
+  if (el.latHint) el.latHint.textContent = 'thinking';
+}
+
+/** Barge-in is a policy with outcomes, not a boolean. */
+const STOP_WORDS = /\b(ruko|reeh|chup|cancel|stop|never mind|hold on|badam)\b/i;
+const BACKCHANNEL = /^\s*(haan|han|hm+h|mhm+|okay|ok|theek|accha|ji|yeah|sahi)\s*[.!?]?\s*$/i;
+function duck(to) {
+  if (el.outGain) el.outGain.gain.value = to;
+}
+function bargePolicy(heard, now) {
+  if (!heard) {
+    // A short vocalisation during playback is a backchannel ("haan"), not an
+    // interrupt: duck, then come back up. Cutting for that is what makes people
+    // stop using interruption at all.
+    if (duckUntil && now > duckUntil) {
+      duckUntil = 0;
+      duck(1);
+    }
+    return;
+  }
+  const held = Math.max(0, now - (stats.since || now));
+  if (!duckUntil) {
+    duckUntil = now + 300;
+    duck(0.35);
+  }
+  // Committed speech, or an explicit stop word, or Esc — that is a real interrupt.
+  if (held > 300 && now - (stats.lastFlush || 0) > 320) {
+    stats.lastFlush = now;
+    duckUntil = 0;
+    flushPlayback();
+    setAgentSpeaking(false);
+    setMode('interrupted by you', 'interrupted', false);
+    stats.interrupts = (stats.interrupts || 0) + 1;
+    setTimeout(() => {
+      if (callState === 'interrupted') setAgentSpeaking(false);
+    }, 700);
+  }
+}
+
+/**
+ * False cutoff — the user starts again within 500 ms of the agent beginning to
+ * speak — is the number that says our endpointing is too eager. It is counted
+ * because guessing at conversation quality is how you ship a walkie-talkie.
+ */
+function onSpeechEnd(now) {
+  stats.turnEndAt = now;
+  if (agentSpeaking && now - (stats.speakStartAt || 0) < 500) {
+    stats.falseCutoff = (stats.falseCutoff || 0) + 1;
   }
 }
 
@@ -406,7 +517,9 @@ function onMessage(ev) {
     setMode('listening', 'listening');
     el.say.textContent = 'Boliye — main sun raha hoon.';
     el.hangup.hidden = false;
+    el.muteBtn.hidden = false;
     el.ptt.hidden = cfg.vad === 'ptt';
+    blip('open');
     if (cfg.vad === 'ptt') el.say.textContent = 'Hold the button and talk.';
     return;
   }
@@ -421,12 +534,17 @@ function onMessage(ev) {
       if (!agentSpeaking) {
         ububble = null;
         setAgentSpeaking(true);
-        el.say.textContent = 'Agent bol raha hai…';
+        stats.speakStartAt = performance.now();
         if (stats.turnStart) {
           const ms = Math.round(performance.now() - stats.turnStart);
           el.sTurnLat.textContent = ms + 'ms';
           el.sTurnLat.dataset.bad = ms > 1200 ? '1' : '0';
           stats.turnStart = 0;
+          // Averages hide the calls people remember. Track the tail.
+          stats.lats = (stats.lats || []).concat(ms).sort((a, b) => a - b);
+          const q = (f) => stats.lats[Math.min(stats.lats.length - 1, Math.floor(f * stats.lats.length))];
+          el.sSpread.textContent = stats.lats.length > 2 ? q(0.5) + '/' + q(0.95) + 'ms' : q(0.5) + 'ms';
+          el.sSpread.dataset.bad = q(0.95) > 1600 ? '1' : '0';
         }
       }
       const raw = atob(b64data);
@@ -436,7 +554,21 @@ function onMessage(ev) {
       el.outBar.style.width = Math.min(100, 30 + activeSrc.length * 18) + '%';
     }
   }
-  if (sc?.inputTranscription?.text) appendTurn('user', sc.inputTranscription.text.trim());
+  if (sc?.inputTranscription?.text) {
+    const heardText = sc.inputTranscription.text.trim();
+    appendTurn('user', heardText);
+    // The other half of the barge-in policy, decided on words rather than energy:
+    // an explicit stop cuts at once, a backchannel just ducks the volume.
+    if (agentSpeaking && STOP_WORDS.test(heardText)) {
+      duckUntil = 0;
+      flushPlayback();
+      setAgentSpeaking(false);
+      setMode('interrupted by you', 'interrupted');
+    } else if (agentSpeaking && BACKCHANNEL.test(heardText)) {
+      duckUntil = 0;
+      duck(1);
+    }
+  }
   if (sc?.outputTranscription?.text) appendTurn('agent', sc.outputTranscription.text);
   if (sc?.turnComplete) {
     abubble = null;
@@ -522,12 +654,25 @@ function teardown() {
   agentSpeaking = false;
   actx?.close().catch(() => {});
   actx = null;
+  blip('close');
+  el.muteBtn.hidden = true;
+  muted = false;
+  el.muteBtn.setAttribute('aria-pressed', 'false');
   el.core.textContent = '🎙';
   el.hangup.hidden = true;
   el.ptt.hidden = true;
   el.say.textContent = 'Tap the mic to start talking. Hinglish chalega.';
   setMode('idle', 'idle');
+  // A call that ends mid-speech must not hand the next call a half-open turn:
+  // without this, the first silence block closes a turn that started in the
+  // previous session and reports it as a multi-thousand-millisecond "turn".
   stats.turnStart = 0;
+  stats.speech = false;
+  stats.since = 0;
+  stats.lastFlush = 0;
+  duckUntil = 0;
+  clearTimeout(thinkTimer);
+  if (el.lat) el.lat.hidden = true;
 }
 
 async function start() {
@@ -535,9 +680,87 @@ async function start() {
   await connect();
 }
 
+// ────────────────────────────────────────────────────────────── a11y prefs ──
+// Honour the OS, but let the user override it in-app and keep that choice:
+// prefers-reduced-motion is not a setting everyone can reach (iOS Safari,
+// locked-down Android), and a voice app is used one-handed on a phone.
+const A11Y_KEY = 'aryans-aicall/a11y';
+const a11y = Object.assign(
+  { motion: 'system', contrast: 'system', scale: '1', cues: true },
+  JSON.parse(localStorage.getItem(A11Y_KEY) || '{}')
+);
+function applyA11y() {
+  const r = document.documentElement;
+  r.dataset.motion = a11y.motion === 'system' ? '' : a11y.motion;
+  r.dataset.contrast = a11y.contrast === 'system' ? '' : a11y.contrast;
+  r.style.setProperty('--font-scale', a11y.scale);
+  localStorage.setItem(A11Y_KEY, JSON.stringify(a11y));
+}
+// A cue that outstays ~150 ms masks the first phoneme of what follows, which is
+// precisely the syllable the ASR needed. Short and quiet, or not at all.
+function blip(kind) {
+  if (!a11y.cues || !actx) return;
+  try {
+  const t = actx.currentTime;
+  const o = actx.createOscillator();
+  const g = actx.createGain();
+  o.frequency.setValueAtTime(kind === 'open' ? 660 : 880, t);
+  o.frequency.exponentialRampToValueAtTime(kind === 'open' ? 990 : 520, t + 0.09);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.16, t + 0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.11);
+  o.connect(g).connect(actx.destination);
+    o.start(t);
+    o.stop(t + 0.13);
+    // Haptics carry the same event for anyone who cannot hear or feel a blip.
+    if (navigator.vibrate) navigator.vibrate(kind === 'open' ? 12 : [8, 24, 8]);
+  } catch {
+    /* no oscillator, no call problem */
+  }
+}
+
 // ────────────────────────────────────────────────────────────── wiring ui ──
 el.pttBtn.addEventListener('click', () => (ws ? teardown() : start()));
+// Esc closes the dialog rather than only cutting audio when a sheet is open.
 el.hangup.addEventListener('click', teardown);
+el.muteBtn.addEventListener('click', () => {
+  muted = !muted;
+  el.muteBtn.setAttribute('aria-pressed', String(muted));
+  el.muteBtn.querySelector('.lbl').textContent = muted ? 'Unmute' : 'Mute';
+  el.muteBtn.setAttribute('aria-label', muted ? 'Unmute microphone' : 'Mute microphone');
+  setMode(muted ? 'muted' : agentSpeaking ? 'agent talking' : 'listening',
+    muted ? 'muted' : agentSpeaking ? 'speaking' : 'listening');
+  if (!agentSpeaking) el.say.innerHTML = muted
+    ? 'Mic muted — the agent still speaks, it just cannot hear you.'
+    : 'Boliye — <b>main sun raha hoon</b>.';
+});
+el.muteBtn.hidden = false;
+
+// Type instead of speak: a real failure mode of voice is "I am on a bus".
+el.textForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const text = el.textInput.value.trim();
+  if (!text) return;
+  if (!ws) return note('Start the session first, then type.', 'err');
+  send({ clientContent: { turns: [{ role: 'user', parts: [{ text }] }], turnComplete: true } });
+  appendTurn('user', text);
+  el.textInput.value = '';
+  beginThinking();
+});
+
+// Jump-to-latest instead of yanking the scroll when the reader scrolled up.
+el.jump?.addEventListener('click', () => stick(true));
+el.thread?.addEventListener('scroll', () => {
+  if (nearBottom() && el.jump) el.jump.hidden = true;
+});
+
+// "How interruption works" disclosure — discoverability, since there are no buttons.
+$('bargeInfo')?.addEventListener('click', (e) => {
+  const fold = $('bargeHelp');
+  const open = fold.hidden;
+  fold.hidden = !open;
+  e.currentTarget.setAttribute('aria-expanded', String(open));
+});
 
 // push to talk: explicit turn boundaries instead of server VAD
 let pttOn = false;
@@ -561,6 +784,10 @@ for (const ev of ['pointerup', 'pointercancel', 'pointerleave'])
 // Barge-in. The model already handles interruption server-side; what it cannot
 // do is un-ring your speakers. We own the flush.
 document.addEventListener('keydown', (e) => {
+  if (e.code === 'Escape' && !el.sheet.hidden) {
+    closeSheet();
+    return;
+  }
   if (e.code === 'Escape' && agentSpeaking) {
     flushPlayback();
     setAgentSpeaking(false);
@@ -583,10 +810,21 @@ const openSheet = () => {
   $('fVad').value = cfg.vad;
   $('fGuard').checked = cfg.guard;
   $('fPrompt').value = cfg.prompt;
+  $('fMotion').value = a11y.motion;
+  $('fContrast').value = a11y.contrast;
+  $('fScale').value = a11y.scale;
+  $('fCues').checked = a11y.cues;
   el.sheet.hidden = false;
+  $('gearBtn').setAttribute('aria-expanded', 'true');
+  // Move focus into the dialog, then hand it back on close.
+  setTimeout(() => $('fKey').focus(), 30);
 };
-const closeSheet = () => (el.sheet.hidden = true);
-$('gearBtn').addEventListener('click', openSheet);
+const closeSheet = () => {
+  el.sheet.hidden = true;
+  $('gearBtn').setAttribute('aria-expanded', 'false');
+  $('gearBtn').focus();
+};
+$('gearBtn').addEventListener('click', () => (el.sheet.hidden ? openSheet() : closeSheet()));
 $('sheetClose').addEventListener('click', closeSheet);
 $('sheetSave').addEventListener('click', () => {
   cfg = load();
@@ -599,6 +837,13 @@ $('sheetSave').addEventListener('click', () => {
     guard: $('fGuard').checked,
     prompt: $('fPrompt').value,
   };
+  Object.assign(a11y, {
+    motion: $('fMotion').value,
+    contrast: $('fContrast').value,
+    scale: $('fScale').value,
+    cues: $('fCues').checked,
+  });
+  applyA11y();
   save(cfg);
   closeSheet();
   note('Saved. Restart the session to apply.', 'sys');
@@ -632,6 +877,7 @@ $('sheetTest').addEventListener('click', async () => {
 
 (async () => {
   cfg = load();
+  applyA11y();
   try {
     const c = await (await fetch('/config')).json();
     cfg.keysafe = Boolean(c.keysafe);

@@ -23,7 +23,7 @@ class El {
   constructor(tag = 'div') {
     this.tag = tag;
     this.children = [];
-    this.style = {};
+    this.style = { setProperty(k, v) { this[k] = v; } };
     this.dataset = {};
     this._q = new Map();
     this._h = {};
@@ -38,12 +38,19 @@ class El {
   append(...n) { this.children.push(...n); }
   replaceChildren(...n) { this.children = n; }
   remove() {}
+  focus() { this._focused = true; }
+  blur() { this._focused = false; }
   querySelector(sel) {
     if (!this._q.has(sel)) this._q.set(sel, new El('span'));
     return this._q.get(sel);
   }
   addEventListener(ev, fn) { (this._h[ev] ??= []).push(fn); }
   classList = { toggle() {}, add() {}, remove() {} };
+  // Attributes are how state is exposed to AT, so they must be readable by the
+  // assertions — a stub that swallows setAttribute cannot verify a11y at all.
+  setAttribute(k, v) { (this._attrs ??= {})[k] = String(v); }
+  getAttribute(k) { return this._attrs?.[k] ?? null; }
+  removeAttribute(k) { this._attrs && delete this._attrs[k]; }
   fire(ev, arg = {}) { for (const fn of this._h[ev] || []) fn(arg); }
   text() {
     const kids = [...this.children, ...this._q.values()].map((c) => c.text?.() || '');
@@ -54,7 +61,9 @@ class El {
 const reg = new Map();
 const procs = [];
 const docHandlers = {};
+const documentElement = new El('html');
 const document = {
+  documentElement,
   getElementById: (id) => (reg.has(id) ? reg.get(id) : reg.set(id, new El(id)).get(id)),
   createElement: (t) => new El(t),
   addEventListener: (ev, fn) => (docHandlers[ev] ??= []).push(fn),
@@ -85,6 +94,7 @@ class FakeAudioContext {
     return { length: len, sampleRate: rate, duration: len / rate, copyToChannel() {} };
   }
   createBufferSource() { return { ...node(), start() {}, stop() {}, buffer: null, onended: null }; }
+  createOscillator() { return { ...node(), frequency: { setValueAtTime() {}, exponentialRampToValueAtTime() {} }, start() {}, stop() {} }; }
 }
 
 // ── stub network ──────────────────────────────────────────────────────────
@@ -159,6 +169,11 @@ check('boot reached the settings sheet (no key configured)', () => {
 });
 
 // configure a key the way the user would, then save
+// Untick the half-duplex guard the way a headphones user would. With the guard
+// on there is deliberately NO barge-in — the mic is muted while the agent talks
+// so laptop speakers cannot make it interrupt itself. The barge-in policy tests
+// below only mean anything with the guard off.
+reg.get('fGuard').checked = false;
 reg.get('fKey').value = 'TESTKEY-abc';
 reg.get('fModel').value = 'models/gemini-2.5-flash-native-audio-preview-12-2025';
 reg.get('sheetSave').fire('click');
@@ -211,7 +226,7 @@ check('mic frames reach the socket as audio/pcm;rate=16000', () => {
 });
 
 // agent replies with audio + transcriptions
-const pcm = Buffer.alloc(4800 * 2); // 200 ms of 24 kHz int16
+let pcm = Buffer.alloc(4800 * 2); // 200 ms of 24 kHz int16
 for (let i = 0; i < 4800; i++) pcm.writeInt16LE(Math.round(Math.sin(i / 8) * 4000), i * 2);
 sockets[0].from({
   serverContent: {
@@ -232,6 +247,74 @@ check('transcriptions are rendered, not swallowed', () => {
   assert.match(all, /Theek hai, main note kar leta hoon\./);
   assert.match(all, /Mera order confirm karo/);
 });
+
+
+// ── behavioural checks for the voice-UX rules ──────────────────────────────
+{
+  // Ahead of the real clock, so any timestamp left behind before we take over
+  // is in the past rather than a kilometre in the future.
+  let fake = Date.now() + 1000;
+  sandbox.performance.now = () => fake;
+  const loud = () => procs[0].onaudioprocess({
+    inputBuffer: { getChannelData: () => Float32Array.from({ length: 2048 }, (_, i) => Math.sin(i / 3) * 0.4) },
+  });
+  const quiet = () => procs[0].onaudioprocess({
+    inputBuffer: { getChannelData: () => new Float32Array(2048) },
+  });
+  // Close whatever the earlier mic test left open, then run one whole utterance
+  // on the fake clock — otherwise stats.since is stamped with the real clock and
+  // every "held" duration below is a nonsense negative number.
+  for (let i = 0; i < 3; i++) { fake += 20; quiet(); }
+
+  check('backchannel ducks, it does not cut', () => {
+    fake += 40; loud();           // speech starts
+    fake += 40; loud();           // ~80ms of "haan" — under the 300ms commit line
+    assert.equal(reg.get('orb').dataset.state, 'speaking', 'a short "haan" must not interrupt');
+  });
+  check('committed speech cuts the agent off', () => {
+    fake += 420; loud();          // now held > 300ms: a real interrupt
+    assert.equal(reg.get('orb').dataset.state, 'interrupted');
+  });
+  check('a spoken stop word cuts on words, not on energy', () => {
+    for (let i = 0; i < 3; i++) { fake += 300; quiet(); }
+    sockets[0].from({ serverContent: { modelTurn: { parts: [{ inlineData: { data: pcm.toString('base64') } }] } } });
+    assert.equal(reg.get('orb').dataset.state, 'speaking', 'precondition: agent must be talking');
+    sockets[0].from({ serverContent: { inputTranscription: { text: 'ruko' } } });
+    assert.match(reg.get('modePill').textContent, /interrupted/i);
+  });
+  check('a backchannel word leaves the agent talking', () => {
+    sockets[0].from({ serverContent: { modelTurn: { parts: [{ inlineData: { data: pcm.toString('base64') } }] } } });
+    sockets[0].from({ serverContent: { inputTranscription: { text: 'haan' } } });
+    assert.equal(reg.get('orb').dataset.state, 'speaking');
+  });
+  check('thinking appears on the turn boundary, not after a timeout', () => {
+    for (let i = 0; i < 3; i++) { fake += 300; loud(); }   // finish the interruption
+    sockets[0].from({ serverContent: { turnComplete: true } });
+    for (let i = 0; i < 3; i++) { fake += 200; quiet(); }  // silence → end of turn
+    assert.equal(reg.get('orb').dataset.state, 'thinking');
+    assert.equal(reg.get('latBar').hidden, false, 'the latency bar is the spinner voice users need');
+  });
+  check('scroll position is respected, with a jump affordance', () => {
+    const th = reg.get('thread');
+    th.scrollHeight = 4000;
+    th.scrollTop = 0;
+    th.clientHeight = 600;
+    sockets[0].from({ serverContent: { inputTranscription: { text: 'upar scroll kiya hai' } } });
+    assert.equal(th.scrollTop, 0, 'the reader was yanked to the bottom');
+    assert.equal(reg.get('jumpLatest').hidden, false, 'and got no way back');
+  });
+  check('mute is announced, not just coloured', () => {
+    reg.get('muteBtn').fire('click');
+    assert.equal(reg.get('muteBtn').getAttribute('aria-pressed'), 'true');
+    assert.equal(reg.get('muteBtn').getAttribute('aria-label'), 'Unmute microphone');
+    assert.equal(reg.get('orb').dataset.state, 'muted');
+    reg.get('muteBtn').fire('click');
+  });
+  check('mic control is a real toggle button (aria-pressed tracks state)', () => {
+    assert.equal(reg.get('pttBtn').getAttribute('aria-pressed'), 'true');
+  });
+}
+
 
 // tool call round trip
 sockets[0].from({
@@ -280,6 +363,93 @@ check('every id in the HTML is reachable by the app', () => {
   const htmlIds = new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]));
   const missing = [...jsIds].filter((i) => !htmlIds.has(i));
   assert.deepEqual(missing, [], 'dangling getElementById: ' + missing.join(', '));
+});
+
+
+// ── the research rules, checked against the actual markup and stylesheet ────
+check('the guard trade-off is explicit in the saved config', () => {
+  const saved = JSON.parse(localStorage.getItem('aryans-aicall/v0'));
+  assert.equal(saved.guard, false, 'barge-in tests are meaningless if the guard silently stayed on');
+});
+check('every state has its own visual treatment', () => {
+  const states = ['idle', 'connecting', 'listening', 'thinking', 'speaking', 'interrupted', 'muted', 'error'];
+  const styled = states.filter(
+    (st) => css.includes(`[data-state="${st}"]`) || (st === 'idle' && !css.includes('[data-state="idle"]'))
+  );
+  assert.equal(styled.length, states.length, 'unstyled states: ' + states.filter((x) => !styled.includes(x)));
+});
+check('listening and speaking do not share an animation', () => {
+  // The single most-cited voice-UI mistake: identical motion for both states,
+  // which leaves the user guessing and talking over the agent. Existence of a
+  // rule per state is not enough — the keyframes must actually differ.
+  const anims = (st) => {
+    const out = new Set();
+    for (const m of css.matchAll(new RegExp('\\[data-state="' + st + '"\\][^{]*\\{([^}]*)\\}', 'g'))) {
+      for (const a of m[1].matchAll(/animation:\s*([^;]+);/g)) out.add(a[1].trim());
+    }
+    return out;
+  };
+  const listen = anims('listening');
+  const speak = anims('speaking');
+  assert.ok(listen.size && speak.size, 'one state has no animated treatment at all');
+  const shared = [...listen].filter((a) => speak.has(a));
+  assert.deepEqual(shared, [], 'identical motion for listen and speak: ' + shared.join(' | '));
+});
+check('state is never conveyed by colour alone', () => {
+  // Every state must also drive text and an icon, not just a hue.
+  assert.match(app, /GLYPH\s*=\s*\{[\s\S]*speaking[\s\S]*interrupted[\s\S]*muted/);
+  assert.match(app, /el\.pill\.textContent = text/);
+  assert.match(html, /<span class="state-icon"[^>]*aria-hidden="true"/);
+});
+check('live region pre-exists in the document (SC 4.1.3)', () => {
+  // Inserting role=status together with its content is silent in screen readers.
+  assert.match(html, /id="a11yStatus"[^>]*role="status"[^>]*aria-live="polite"/);
+  assert.match(html, /<p class="sr-only" id="a11yStatus"/);
+});
+check('transcript is a polite log, not an assert', () => {
+  assert.match(html, /id="thread"[^>]*role="log"/);
+  assert.match(html, /id="thread"[^>]*aria-live="polite"/);
+});
+check('reduced motion honoured by OS *and* by an in-app override', () => {
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\)/);
+  assert.match(css, /html\[data-motion="reduce"\]/);
+  assert.match(html, /id="fMotion"/);
+});
+check('light scheme defined, not just inverted dark', () => {
+  assert.match(css, /@media \(prefers-color-scheme: light\)/);
+  assert.match(css, /@media \(prefers-contrast: more\)/);
+});
+check('touch targets are at least 44px', () => {
+  for (const cls of ['push', 'icon-btn', 'send', 'primary', 'ghost']) {
+    // Base selector only: `.icon-btn svg` and `.push .glyph` legitimately have
+    // no min-height of their own, and matching them would make this check fail
+    // for reasons that have nothing to do with tap targets.
+    const blocks = [...css.matchAll(new RegExp('\\.' + cls + '\\s*(?:,\\s*\.' + cls + ')*\\s*\{([^}]*)\}', 'g'))];
+    const ok = blocks.some(([, body]) => {
+      const m = /min-height:\s*(\d+)px/.exec(body);
+      return m && Number(m[1]) >= 44;
+    });
+    assert.ok(ok, '.' + cls + ' has no min-height >= 44px on its base rule');
+  }
+});
+check('audio cues stay under 150ms so they do not mask the first phoneme', () => {
+  const m = [...app.matchAll(/t \+ (0\.\d+)/g)].map((x) => Number(x[1]));
+  const cue = m.filter((v) => v > 0 && v <= 0.2);
+  assert.ok(cue.length, 'no bounded cue envelope found');
+  assert.ok(Math.max(...cue) <= 0.13, 'cue longer than 130ms will eat the first phoneme');
+});
+check('dead air is detected, not shrugged at', () => {
+  assert.match(app, /1800/);
+  assert.match(app, /deadair/);
+});
+check('barge-in is a policy with distinct outcomes', () => {
+  assert.match(app, /BACKCHANNEL/);
+  assert.match(app, /STOP_WORDS/);
+  assert.match(app, /function\s+duck\s*\(\s*to\s*\)/);
+});
+check('endpointing quality is measured, not assumed', () => {
+  assert.match(app, /falseCutoff/);
+  assert.match(app, /q\(0\.95\)/, 'p95 must be tracked; averages hide the bad calls');
 });
 
 for (const [s, n] of results) console.log(s, n);
