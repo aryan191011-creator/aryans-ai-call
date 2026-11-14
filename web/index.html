@@ -203,7 +203,14 @@
     </fieldset>
 
     <label class="field">
-      <span>Persona</span>
+      <span>Opening line <em>what it says the moment the call connects</em></span>
+      <input id="fGreet" type="text" autocomplete="off" />
+      <small>The Live API waits for your voice after connecting, so without this the first
+      thing you hear is silence. Sent as a system signal, never shown in the transcript.</small>
+    </label>
+
+    <label class="field">
+      <span>Persona <em>blank resets to the default</em></span>
       <textarea id="fPrompt" rows="7" spellcheck="false"></textarea>
     </label>
 

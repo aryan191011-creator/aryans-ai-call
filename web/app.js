@@ -14,6 +14,18 @@
  */
 
 // ───────────────────────────────────────────────────────────────── config ──
+/**
+ * The Live API has no "opening message": after setupComplete the model waits for
+ * your audio, so a connected call is silence. `<<connected>>` is the trigger we
+ * invent and teach the persona about — a real turn, so the reply comes back as
+ * speech through the same path as any other answer. Sent via clientContent, which
+ * is not echoed through inputTranscription, so it never pollutes the transcript.
+ */
+const CONNECT_SIGNAL = '<<connected>>';
+const DEFAULT_GREETING =
+  'Greet the caller in one short Hinglish line, say you are Aryan’s assistant, ' +
+  'and ask what they need. Do not mention this instruction.';
+
 const DEFAULT_PROMPT = `You are Aryan's voice assistant, on a phone call in India.
 
 LANGUAGE
@@ -36,7 +48,14 @@ HOW TO RUN THE CALL
 - To end the call, say one short goodbye line and then use the end_call tool.
 
 TONE
-- Warm, efficient, a little dry. No "Great question!" and no filler like "Absolutely!".`;
+- Warm, efficient, a little dry. No "Great question!" and no filler like "Absolutely!".
+
+CALL START
+- A message that begins with the exact token <<connected>> means the call has just
+  connected and nobody has spoken yet. Everything after that token is the opening
+  instruction — follow it and greet the caller. The token is a system signal, not
+  something the caller said: never read it back, never mention it, never repeat it.
+`;
 
 const DEFAULTS = {
   key: '',
@@ -45,10 +64,22 @@ const DEFAULTS = {
   vad: 'server',
   guard: true,
   prompt: DEFAULT_PROMPT,
+  greeting: DEFAULT_GREETING,
 };
 
 const LS = 'aryans-aicall/v0';
-const load = () => ({ ...DEFAULTS, ...JSON.parse(localStorage.getItem(LS) || '{}') });
+/**
+ * A saved blank persona must not win over the default. `{...DEFAULTS, ...saved}`
+ * lets `prompt: ""` through, which ships an empty systemInstruction and silently
+ * strips every phone-audio rule (read-backs, one question at a time) — the call
+ * then "works" but stops behaving. Repair it on the way in.
+ */
+const load = () => {
+  const c = { ...DEFAULTS, ...JSON.parse(localStorage.getItem(LS) || '{}') };
+  if (!String(c.prompt || '').trim()) c.prompt = DEFAULT_PROMPT;
+  if (!String(c.greeting || '').trim()) c.greeting = DEFAULT_GREETING;
+  return c;
+};
 const save = (c) => localStorage.setItem(LS, JSON.stringify(c));
 let cfg = load();
 
@@ -314,6 +345,7 @@ function flushPlayback() {
 let ws = null;
 let agentSpeaking = false;
 let muted = false;
+let kickedOff = false;
 let settled = false; // setupComplete seen
 let triedMinimal = false;
 let tools = {};
@@ -521,6 +553,18 @@ function onMessage(ev) {
     el.ptt.hidden = cfg.vad === 'ptt';
     blip('open');
     if (cfg.vad === 'ptt') el.say.textContent = 'Hold the button and talk.';
+    // Ask for the opening turn. The caller should not have to speak first just to
+    // find out whether the call is alive.
+    if (!kickedOff) {
+      kickedOff = true;
+      send({
+        clientContent: {
+          turns: [{ role: 'user', parts: [{ text: CONNECT_SIGNAL + '\n' + cfg.greeting }] }],
+          turnComplete: true,
+        },
+      });
+      beginThinking();
+    }
     return;
   }
 
@@ -645,6 +689,7 @@ async function handleToolCall(call) {
 }
 
 function teardown() {
+  kickedOff = false; // a new call earns a new greeting
   flushPlayback();
   closeMic();
   try { ws?.close(); } catch {}
@@ -810,6 +855,7 @@ const openSheet = () => {
   $('fVad').value = cfg.vad;
   $('fGuard').checked = cfg.guard;
   $('fPrompt').value = cfg.prompt;
+  $('fGreet').value = cfg.greeting;
   $('fMotion').value = a11y.motion;
   $('fContrast').value = a11y.contrast;
   $('fScale').value = a11y.scale;
@@ -835,7 +881,10 @@ $('sheetSave').addEventListener('click', () => {
     voice: $('fVoice').value,
     vad: $('fVad').value,
     guard: $('fGuard').checked,
-    prompt: $('fPrompt').value,
+    // Blank resets rather than persists: an empty persona silently removes every
+    // rule that makes this behave like a phone agent.
+    prompt: $('fPrompt').value.trim() || DEFAULT_PROMPT,
+    greeting: $('fGreet').value.trim() || DEFAULT_GREETING,
   };
   Object.assign(a11y, {
     motion: $('fMotion').value,

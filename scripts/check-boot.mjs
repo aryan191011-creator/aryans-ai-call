@@ -205,9 +205,36 @@ check('first frame is a setup with model, AUDIO modality and tools', () => {
 // handshake
 sockets[0].from({ setupComplete: {} });
 await tick();
-check('setupComplete lands the UI in listening', () => {
-  assert.equal(reg.get('modePill').textContent, 'listening');
+check('setupComplete opens the call and puts controls on screen', () => {
+  // 'thinking', not 'listening': we asked for a greeting on connect, so the
+  // honest state while that comes back is waiting — the old expectation
+  // ('listening') described the bug where a connected call sat in silence.
+  assert.equal(reg.get('modePill').textContent, 'thinking');
   assert.equal(reg.get('hangup').hidden, false, 'hangup button should appear');
+});
+
+
+// ── the greeting path (a connected call must not be silence) ───────────────
+check('connecting greets the caller unprompted', () => {
+  const kick = sockets[0].frames('clientContent');
+  assert.equal(kick.length, 1, 'expected exactly one kickoff turn, got ' + kick.length);
+  const text = kick[0].clientContent.turns[0].parts[0].text;
+  assert.ok(text.startsWith('<<connected>>'), 'kickoff must start with the signal token');
+  assert.ok(kick[0].clientContent.turnComplete, 'an incomplete turn never triggers a reply');
+});
+check('the kickoff opens a thinking state, so the wait is honest', () => {
+  assert.equal(reg.get('latBar').hidden, false);
+});
+check('the settings sheet arrives populated, not empty', () => {
+  assert.ok(reg.get('fPrompt').value.length > 400, 'persona textarea was blank: ' + reg.get('fPrompt').value.length + ' chars');
+  assert.ok(reg.get('fGreet').value.length > 20, 'greeting field was blank');
+});
+check('the trigger and the persona cannot drift apart', () => {
+  // The token appears in both halves of the contract; renaming one must fail here.
+  const def = /const CONNECT_SIGNAL = '([^']+)'/.exec(app);
+  assert.ok(def, 'CONNECT_SIGNAL not found');
+  assert.match(app.slice(0, app.indexOf('const DEFAULTS')), new RegExp(def[1]),
+    'DEFAULT_PROMPT does not document the token it is sent');
 });
 
 // drive the mic: loud 2048-sample blocks must become 16 kHz PCM frames
@@ -450,6 +477,33 @@ check('barge-in is a policy with distinct outcomes', () => {
 check('endpointing quality is measured, not assumed', () => {
   assert.match(app, /falseCutoff/);
   assert.match(app, /q\(0\.95\)/, 'p95 must be tracked; averages hide the bad calls');
+});
+
+
+check('a blank persona resets to the default instead of persisting', () => {
+  reg.get('fPrompt').value = '';
+  reg.get('fGreet').value = '   ';
+  reg.get('sheetSave').fire('click');
+  const saved = JSON.parse(localStorage.getItem('aryans-aicall/v0'));
+  assert.match(saved.prompt, /^You are Aryan's voice assistant/, 'empty save must not strip the persona');
+  assert.ok(saved.greeting.length > 20, 'empty greeting must fall back to the default');
+  assert.ok(saved.prompt.includes('<<connected>>'), 'repaired persona lost the CALL START contract');
+});
+
+// start a second call, then verify it greeted on its own terms
+reg.get('pttBtn').fire('click');
+await tick();
+check('second session opens a fresh socket', () => {
+  const ws2 = sockets[sockets.length - 1];
+  assert.notEqual(ws2, sockets[0], 'expected a fresh socket for the second call');
+  ws2.from({ setupComplete: {} });
+});
+await tick();
+check('the new socket got the connected signal', () => {
+  const ws2 = sockets[sockets.length - 1];
+  const kick = ws2.frames('clientContent');
+  assert.equal(kick.length, 1, 'kickedOff was not reset by teardown');
+  assert.ok(kick[0].clientContent.turns[0].parts[0].text.startsWith('<<connected>>'));
 });
 
 for (const [s, n] of results) console.log(s, n);
