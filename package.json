@@ -12,7 +12,8 @@
     "dev": "node server.mjs",
     "check:relay": "node scripts/check-relay.mjs",
     "serve": "bash scripts/serve.sh",
-    "check:preview": "bash scripts/ensure-preview.sh"
+    "check:preview": "bash scripts/ensure-preview.sh",
+    "check:boot": "node scripts/check-boot.mjs"
   },
   "optionalDependencies": {
     "ws": "^8.23.0"

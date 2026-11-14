@@ -53,8 +53,15 @@ if (PROXY) {
   }
 }
 
+let t0 = Date.now();
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
+  // A request line per hit is the whole point: when someone reports "the
+  // preview is dead", this answers the only question that matters — did their
+  // browser ever reach us, or did it die before that?
+  const seen = () =>
+    console.log(`[http] ${req.method} ${url.pathname} → ${res.statusCode} (${Date.now() - t0}ms up)`);
+  res.on('finish', seen);
 
   if (url.pathname === '/healthz') {
     res.writeHead(200, { 'content-type': 'application/json' });
