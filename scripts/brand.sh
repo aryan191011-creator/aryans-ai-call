@@ -238,6 +238,19 @@ echo "  colors.xml, styles.xml (+ v31), 2 adaptive icons"
 echo "▸ README header"
 convert "$OUT/og-cover.png" -filter Lanczos -resize 1200x630 "PNG32:$OUT/readme-header.png"
 
+# Strip metadata from everything, on a second pass over the files rather than on each command:
+# a few hundred bytes per PNG of software tags that no launcher reads, and this repo carries
+# the PNGs.
+#
+# The tIME exclusion is the part that actually matters. ImageMagick writes a creation timestamp
+# chunk into every PNG it saves, so two runs of this script produced files with identical pixels
+# and 17 differing bytes — which makes `npm run brand` look as though it changed the artwork, and
+# makes any "regenerate and diff the tree" check impossible to write. Pixels are the thing under
+# version control here, so pixels are the only thing the bytes may depend on.
+for f in "$OUT"/*.png "$RES"/mipmap-*/*.png "$RES"/drawable-nodpi/*.png; do
+  convert "$f" -strip -define png:exclude-chunk=tIME "PNG32:$f"
+done
+
 echo
 for f in "$OUT"/*.png; do
   printf '  %-26s %s\n' "$(basename "$f")" "$(identify -format '%wx%h' "$f")"

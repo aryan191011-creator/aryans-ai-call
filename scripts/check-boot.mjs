@@ -39,8 +39,13 @@ class El {
     this.scrollTop = 0;
     this.scrollHeight = 0;
   }
-  append(...n) { this.children.push(...n); }
-  appendChild(n) { this.children.push(n); return n; } // the DOM API app.js actually calls
+  append(...n) { this.children.push(...n); for (const c of n) if (c) c._parent = this; }
+  appendChild(n) { this.children.push(n); n._parent = this; return n; } // the DOM API app.js calls
+  // Real containment, via the parent links appendChild maintains. The focus guard in
+  // app.js asks `sheet.contains(target)` and treats a false answer as an escape, so a
+  // stub that always returned true would make its check pass on the case that matters and
+  // say nothing about the case it exists for.
+  contains(n) { for (let p = n; p; p = p._parent) if (p === this) return true; return false; }
   replaceChildren(...n) { this.children = n; }
   remove() {}
   focus() { this._focused = true; }
@@ -86,6 +91,30 @@ const document = {
 /** Fire an event the way the document does, so handlers registered with
  *  document.addEventListener run with the target the real browser would give them. */
 const docFire = (ev, e) => { for (const fn of docHandlers[ev] || []) fn(e); };
+// The sheet's background-inert logic iterates `document.body.children`, and the harness had no
+// body at all. The list is read out of index.html rather than typed here: the top-level tags in
+// the file ARE the body children, and an element with an id is the same object app.js sees, so
+// the identity test `node === el.sheet` in app.js means something in here. A hand-written list
+// would keep passing after someone wrapped the page in a <div> and inerted the wrong node.
+const bodyKids = [];
+{
+  const start = html.indexOf('<body');
+  const end = html.indexOf('</body>');
+  for (const line of html.slice(start, end).split('\n')) {
+    const m = /^<([a-z]+)((?:[^>"']|"[^"]*"|'[^']*')*)/.exec(line);
+    if (!m) continue;
+    const attrs = m[2];
+    const idm = /\bid="([^"]+)"/.exec(attrs);
+    const node = idm ? document.getElementById(idm[1]) : new El(m[1]);
+    node.tagName = m[1].toUpperCase();
+    node._tag = m[1];
+    bodyKids.push(node);
+  }
+}
+assert.ok(bodyKids.length >= 4, `index.html should have several top-level elements, saw ${bodyKids.length}`);
+document.body = new El('body');
+document.body.append(...bodyKids);
+
 const store = new Map();
 const localStorage = {
   getItem: (k) => (store.has(k) ? store.get(k) : null),
@@ -1346,6 +1375,119 @@ check('the failure that needs a new row opens the panel that has it', () => {
   const err = /function reportError\(err\) \{([\s\S]*?)\n\}/.exec(app)[1];
   assert.match(err, /NOT_FOUND\|404\|no such model\|unsupported/, 'the retired-row test is gone');
   assert.match(err, /openSheet\('model'\)/, 'the row failure no longer lands on the Model panel');
+});
+
+// ── the dialog keeps the keyboard ────────────────────────────────────────────
+// The sheet is a full-viewport overlay, so the page behind it is still in tab order. These
+// checks need real containment, and it comes from the markup: every id between the sheet's
+// opening tag and the `</div>` that closes it at column zero is a descendant of the sheet, which
+// is exactly the rule a browser applies. Typed here it would drift the first time a control
+// moved in or out of the dialog.
+const sheetIds = (() => {
+  const open = html.indexOf('<div class="sheet"');
+  const close = html.indexOf('\n</div>', open);
+  const inside = [...html.slice(open, close).matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]);
+  const sheetEl = document.getElementById('sheet');
+  for (const id of inside) sheetEl.appendChild(document.getElementById(id));
+  // One of each, or the containment below proves nothing: a sheet with no children contains
+  // nothing, and a guard tested against that would be green for the wrong reason.
+  return inside;
+})();
+
+check('only the open and close functions may show or hide the sheet', () => {
+  // `inert` is applied by openSheet and lifted by closeSheet. A third writer of the visibility
+  // flag — a `sheet.hidden = false` in some future deep-link handler, say — opens the dialog
+  // with the page behind still inert, and the app becomes its own keyboard trap: nothing on
+  // screen answers Tab, and there is no error anywhere to read.
+  const writes = [...app.matchAll(/^\s*el\.sheet\.hidden\s*=/gm)];
+  assert.equal(writes.length, 2, `expected 2 writes of sheet.hidden, found ${writes.length}`);
+  const openAt = app.indexOf('const openSheet = ');
+  const closeAt = app.indexOf('const closeSheet = () => {');
+  for (const w of writes) {
+    const inOpen = w.index > openAt && w.index < closeAt;
+    const inClose = w.index > closeAt && w.index < closeAt + 700;
+    assert.ok(inOpen || inClose,
+      `a sheet.hidden write at offset ${w.index} is outside openSheet/closeSheet`);
+  }
+  // And Escape, which the keyboard user actually presses, goes through closeSheet rather than
+  // poking the flag itself — that is how the inert and hash cleanup survive a new dismiss path.
+  const escAt = app.indexOf("if (e.code === 'Escape' && !el.sheet.hidden)");
+  assert.ok(escAt > 0, 'the Escape branch was not found at all');
+  // slice(start, start + n), not slice(start, n): the second form silently reads the first 220
+  // characters of the file, which is a way for an assertion to be about nothing at all.
+  const esc = app.slice(escAt, escAt + 220);
+  assert.match(esc, /closeSheet\(\)/, 'Escape must call closeSheet');
+  assert.doesNotMatch(esc, /sheet\.hidden\s*=/, 'Escape must not write the flag directly');
+});
+
+check('the fake DOM contains both sides of the dialog boundary', () => {
+  const sheetEl = document.getElementById('sheet');
+  {
+    assert.ok(sheetIds.includes('sheetClose') && sheetIds.includes('fKey'),
+      'the sheet is expected to own its controls');
+    assert.ok(!sheetIds.includes('gearBtn') && !sheetIds.includes('composer'),
+      'the page behind must stay outside the sheet subtree');
+    assert.equal(sheetEl.contains(document.getElementById('sheetClose')), true);
+    assert.equal(sheetEl.contains(document.getElementById('gearBtn')), false);
+    assert.ok(sheetIds.length >= 20, `only ${sheetIds.length} ids inside the sheet, which is not all of them`);
+    assert.ok(!sheetIds.includes('gearBtn'), 'the gear must be outside');
+  }
+});
+
+check('the page behind the dialog is inert while it is open, and not afterwards', () => {
+  openOn('key');
+  const kids = document.body.children;
+  const sheetEl = document.getElementById('sheet');
+  const tagOf = (k) => `${(k.tagName || k.tag) || 'anon'}${k === sheetEl ? '(dialog)' : ''}${k.inert === true ? '=inert' : ''}`;
+  // A set equality, not a one-directional "nothing was missed". Asserting only that no
+  // focusable child survived would also pass when the app inerted the <script> tag it is told
+  // to skip, because the filter and the app would be excluding the same node — a check written
+  // around its own subject. Both sides have to be pinned: exactly these nodes, no more.
+  const expected = kids.filter((k) => k !== sheetEl && !['SCRIPT', 'STYLE'].includes(k.tagName));
+  const got = kids.filter((k) => k.inert === true);
+  assert.deepEqual(got.map(tagOf).sort(), expected.map(tagOf).sort(),
+    `inerted set is not the background set\n        expected ${expected.map((k) => k.tagName).join(',') || '∅'}\n        got      ${kids.filter((k) => k.inert === true).map((k) => k.tagName).join(',') || '∅'}`);
+  assert.ok(expected.length >= 3, `the page behind has only ${expected.length} nodes: ${expected.map((k) => k.tagName).join(', ')}`);
+  assert.notEqual(sheetEl.inert, true, 'the dialog itself must never be inert');
+  reg.get('sheetClose').fire('click');
+  const left = kids.filter((k) => k.inert === true).map((k) => k._tag || k.tag);
+  assert.deepEqual(left, [], `still inert after close: ${left.join(', ')}`);
+});
+
+check('un-inerting happens before focus goes back to the gear', () => {
+  // Order is the whole bug: focus on an inert element is refused, silently, so a closeSheet
+  // that focuses first and un-inerts second leaves the keyboard nowhere and looks like a
+  // handler that never ran.
+  const body = app.slice(app.indexOf('const closeSheet = () => {'));
+  const until = body.indexOf('};');
+  const seq = body.slice(0, until);
+  const un = seq.indexOf('setBackgroundInert(false)');
+  const focus = seq.indexOf("$('gearBtn').focus()");
+  assert.ok(un >= 0 && focus >= 0, `expected both calls in closeSheet, got ${JSON.stringify(seq.slice(0, 200))}`);
+  assert.ok(un < focus, 'focus before inert=false is a focus that does nothing');
+});
+
+check('focus that escapes the dialog is pulled back to the panel that is open', () => {
+  openOn('voice');
+  const sheetEl = document.getElementById('sheet');
+  // Inside first: a guard that yanks focus back on every focusin would make the dialog
+  // unusable and still satisfy a test that only checks the escape case.
+  const before = document.getElementById('fVoice');
+  before._focused = false;
+  docFire('focusin', { target: before });
+  assert.notEqual(before._focused, true, 'a focus move inside the sheet must be left alone');
+  assert.notEqual(sheetEl.contains(before), false, 'fVoice should be inside the sheet');
+  // Now the escape: the browser has moved focus to a control on the page behind.
+  const outside = document.getElementById('gearBtn');
+  docFire('focusin', { target: outside });
+  assert.equal(document.getElementById('fVoice')._focused, true,
+    'escaping focus should come back to the field this panel is about');
+  // And with the sheet closed, the guard has no business touching anything.
+  reg.get('sheetClose').fire('click');
+  const stray = document.getElementById('composer');
+  stray._focused = false;
+  docFire('focusin', { target: stray });
+  assert.equal(stray._focused, false, 'no rescue when the dialog is not open');
 });
 
 check('a thrown WebSocket constructor is reported, not swallowed', () => {

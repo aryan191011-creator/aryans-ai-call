@@ -1986,12 +1986,49 @@ const openSheet = (wanted) => {
   $('fScale').value = a11y.scale;
   $('fCues').checked = a11y.cues;
   el.sheet.hidden = false;
+  setBackgroundInert(true);
   $('gearBtn').setAttribute('aria-expanded', 'true');
   // Move focus into the dialog, then hand it back on close — into the panel that was
   // asked for, which is the field the person came here to change.
   showPanel(panelFromHash() || wanted || panel, { force: true });
 };
+// ── keeping the keyboard inside the dialog ─────────────────────────────────
+// `aria-modal` tells a screen reader to ignore the page behind the sheet. It does nothing to
+// Tab: nine presses from the first control land you in a composer button that is invisible,
+// focused, and still able to start a call. `inert` is the real fix and it is one line per
+// element — it removes the whole subtree from tab order, from clicking, and from the
+// accessibility tree at once, which a hand-rolled keydown handler only manages for Tab.
+//
+// It is applied to the sheet's siblings rather than to a wrapper, because there is no wrapper:
+// the page's header, main and footer are body children, and putting `inert` on `body` while the
+// dialog lives inside it would inert the dialog too.
+const setBackgroundInert = (on) => {
+  const kids = (typeof document !== 'undefined' && document.body && document.body.children) || [];
+  for (const node of kids) {
+    if (!node || node === el.sheet) continue;
+    const tag = ((node.tagName || '') + '').toUpperCase();
+    if (tag === 'SCRIPT' || tag === 'STYLE') continue;   // never focusable; nothing to take away
+    node.inert = on;
+  }
+};
+// And a guard for the browsers that do not have it, where `inert` above is a property assignment
+// on a DOM node that nothing reads. Rather than ordering every focusable control in the sheet —
+// a list that goes stale the day a button is added, and which the hidden panels make longer
+// still — this watches for focus that has already left and pulls it back to the field the
+// current panel is about. It is a correction, not a ring: it cannot get the direction wrong,
+// because it never tries to predict the order.
+document.addEventListener('focusin', (e) => {
+  if (el.sheet.hidden) return;
+  const t = e.target;
+  if (!t || !el.sheet.contains || el.sheet.contains(t)) return;
+  const back = $(PANEL_FOCUS[panel]) || $('sheetClose');
+  if (back && back.focus) back.focus();
+});
 const closeSheet = () => {
+  // Un-inert first, then focus. The other order does nothing at all: focus on an inert element
+  // is refused, and the refusal is silent, so the bug is "the gear is not focused after you
+  // close settings" reported against the keyboard handler rather than against this line.
+  setBackgroundInert(false);
   el.sheet.hidden = true;
   $('gearBtn').setAttribute('aria-expanded', 'false');
   clearHash();

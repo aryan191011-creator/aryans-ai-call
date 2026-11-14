@@ -33,6 +33,12 @@ Then open it, paste a **free** Gemini API key from
 [aistudio.google.com/apikey](https://aistudio.google.com/apikey) into ⚙, save, and talk.
 No `npm install`, no build step, no dependencies — the whole app is three static files.
 
+**On a phone:** the [latest release](../../releases/latest) carries `app-release.apk`, an
+installable shell around these same three files. It is not a separate app and there is no
+second codebase to keep in sync — the bundle is staged out of `web/` at build time. Its reason
+for existing is that a page served over plain `http://192.168.x.x:8787` has no microphone at
+all, and a WebView serving itself from assets does. See *The APK*.
+
 **Getting a key costs nothing but has two catches worth knowing up front:**
 
 1. Google may use prompts sent on the free tier to improve its products. Paid tiers don't.
@@ -57,6 +63,7 @@ claimed here.
 | Cover any pause approaching **2 s** | A dead-air watchdog at 1800 ms says so in the UI and increments a counter — dead-air p95 is measured, not shrugged at |
 | Audio cues must stay **under 150 ms** or they mask the first phoneme | Earcons are 110 ms with a 130 ms ceiling, synthesised in WebAudio (no asset, no network), mirrored as haptics, and can't take down a call if the node is missing |
 | A modal that opens on the wrong field loses the keyboard | Focus moves to the field the panel is about (`#statsReset` on Quality, Close on the one panel with nothing to edit), and `Esc` from any panel closes the dialog and takes the hash with it |
+| Nine presses of Tab should not leave the dialog | Everything but the sheet is `inert` while it is open — removed from tab order, from clicks and from the accessibility tree at once — and a `focusin` guard pulls focus back for the browsers that lack `inert`. `aria-modal` alone does neither: it only tells a screen reader to look away, so the composer button behind the backdrop stays focused and still starts a call. Un-inerting happens *before* focus returns to the gear, because focus on an inert element is refused silently and that reads as a broken keyboard handler |
 | A live region inserted *with* its content is silent | `#a11yStatus` ships in the initial HTML with `role="status"` + `aria-live="polite"`; the transcript is `role="log"` polite so it announces without stealing focus |
 | A pulsing background is invisible to assistive tech | The mic control is a real APG toggle button; `aria-pressed` tracks the session, and mute sets both `aria-pressed` and a matching `aria-label` |
 | Auto-scroll must not yank a reader who scrolled up | `stick()` only follows while pinned within 90 px of the bottom; otherwise a "New reply ↓" pill appears and the scroll position is left alone |
@@ -103,7 +110,10 @@ Design decisions worth defending:
   say "pick another row" and open the Model panel itself — which is the repair step, not a
   hint. Layout rule with a test behind it: `.panel` gets no `display` property, because a
   `display` on an element hidden with `hidden` wins on cascade origin and the sheet would
-  show all ten panels stacked.
+  show all ten panels stacked. Only `openSheet` and `closeSheet` may flip the sheet's
+  visibility — a check counts the writes in the file, because a third writer would open the
+  dialog with the page behind still `inert`, which is the app trapping its own keyboard with
+  no error to read.
 - **There is a text field.** "I am on a bus" is a normal reason voice fails, and a
   voice-first UI that offers no keyboard fallback just loses the call.
 - **Suggested openers replace the empty state.** Voice has no buttons, so
@@ -314,6 +324,13 @@ adb install app-release.apk        # or just open the Release page and tap the .
   is unsigned-stripped, unobfuscated and a three-second unzip to read. Type it once on the
   `Key` panel; it lives in that app's `localStorage` and goes only to
   `generativelanguage.googleapis.com`.
+- **Verified where.** In the sandbox: 133 boot checks and 29 static APK checks, and the APK is
+  never built here — there is no JDK, Gradle or Android SDK in it and `dl.google.com` is
+  unreachable, so an APK produced by this container would be a claim, not an artifact. In CI:
+  the build, the signature, `aapt2 dump badging` on the result (package, permissions, and
+  `versionName` matched against the tag), and the unbundled page. What nobody has done yet is
+  tap the green button on a real phone with this APK installed. Nobody should pretend that step
+  is covered by a check script.
 - **Build it yourself:** `cd android && gradle :app:assembleRelease`. There is no wrapper jar
   in the repo — a 43 KB binary whose only job is to download a distribution is a supply-chain
   surface nobody reviews. Run `gradle wrapper` once if you want `./gradlew`.
