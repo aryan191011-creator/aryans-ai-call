@@ -10,7 +10,9 @@
   "scripts": {
     "start": "node server.mjs",
     "dev": "node server.mjs",
-    "check:relay": "node scripts/check-relay.mjs"
+    "check:relay": "node scripts/check-relay.mjs",
+    "serve": "bash scripts/serve.sh",
+    "check:preview": "bash scripts/ensure-preview.sh"
   },
   "optionalDependencies": {
     "ws": "^8.23.0"
