@@ -1,7 +1,15 @@
 plugins {
-    // 8.1.4 rather than the newest: 8.1 is the line that runs on the ubuntu-24.04 image with
-    // JDK 17 and an Android SDK 34 install, which is what Actions hands out. Chasing the
-    // latest AGP buys an upgrade to the Gradle and SDK requirements as well, for an app whose
-    // entire build is "copy three files into a zip and sign it".
-    id 'com.android.application' version '8.1.4'
+    // 8.1.4 rather than the newest: 8.1 is the line that runs with JDK 17 and an SDK 34
+    // install, which is what Actions hands out. Chasing the latest AGP buys an upgrade to the
+    // Gradle and SDK requirements as well, for an app whose entire build is "copy three files
+    // into a zip and sign it".
+    //
+    // `apply false` is not style, it is the bug this repo actually shipped once. A version
+    // number in the root project's plugins block *applies* the plugin to the root project, so
+    // Gradle configures `aryans-ai-call` itself as an Android application, finds no compileSdk
+    // there (it belongs to :app), and dies with "compileSdkVersion is not specified. Please add
+    // it to build.gradle" — pointing you at a file that has no android block in it. The version
+    // is declared here so :app can name the plugin without repeating it; applying it is
+    // :app's business alone.
+    id 'com.android.application' version '8.1.4' apply false
 }

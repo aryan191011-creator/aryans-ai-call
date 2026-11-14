@@ -310,6 +310,25 @@ check('the java compiles-looking: balanced, no stubs, no TODO', () => {
   assert.doesNotMatch(java, /^\s*public .*\{\s*\}\s*$/m, 'empty method body');
 });
 
+check('only :app is an Android project', () => {
+  // The root project declares the plugin so the version is written once. If it also *applies*
+  // it, Gradle tries to configure the repository itself as an app, and the error names a
+  // compileSdkVersion that no android block in that file ever promised.
+  const root = read(paths.root);
+  const settings = read(paths.settings);
+  const decls = [...root.matchAll(/^\s*id '([\w.]+)'(.*)$/gm)];
+  assert.ok(decls.length >= 1, 'the root build.gradle declares no plugin at all');
+  for (const [, id, tail] of decls) {
+    if (/android/.test(id)) {
+      assert.match(tail, /apply false/, `${id} is applied to the ROOT project — no compileSdk here`);
+    }
+  }
+  assert.match(settings, /include ':app'/, 'settings.gradle must include the app module');
+  assert.doesNotMatch(settings, /include ':app'\s*\n\s*include/, 'one module, no second android project');
+  assert.match(app, /^plugins \{\n {4}id 'com\.android\.application'\n\}/m,
+    ':app must name the plugin without a version — that is the root project\'s job');
+});
+
 check('gradle wires staging so no build path can skip it', () => {
   assert.match(app, /tasks\.named\('preBuild'\) \{ dependsOn tasks\.named\('copyWebAssets'\) \}/);
   // Anchored to the start of a line: `// assets.srcDir genAssets` in a commented-out block is
