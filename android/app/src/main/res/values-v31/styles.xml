@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <!-- API 31+ draws the system splash itself. Telling it the icon and the colour is two
+       lines; shipping a hand-made splash Activity would be a layout, a timer and a
+       race with the page's own first paint, all to draw something the OS now does. -->
+  <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
+    <item name="android:windowBackground">@color/surface</item>
+    <item name="android:statusBarColor">@color/surface</item>
+    <item name="android:navigationBarColor">@color/surface</item>
+    <item name="android:windowSplashScreenBackground">@color/surface</item>
+    <item name="android:windowSplashScreenAnimatedIcon">@drawable/app_splash_icon</item>
+  </style>
+</resources>

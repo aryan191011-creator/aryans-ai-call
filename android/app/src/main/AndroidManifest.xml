@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- The page is bundled, but the call is not: every byte of audio goes to
+         generativelanguage.googleapis.com over a WebSocket, from inside this WebView. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- The one permission that actually decides whether the app works. WebView grants a page
+         RESOURCE_AUDIO_CAPTURE only if the host app already holds RECORD_AUDIO, so this is not
+         belt-and-braces: without it the mic button answers "blocked" forever. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+    <!-- Declared as required-then-optional rather than required:false, so the app still
+         installs on a device with no microphone (a tablet, a chromebook) and the page's own
+         "voice unavailable" path handles it, instead of the Play listing saying "your device
+         is not compatible". -->
+    <uses-feature
+        android:name="android.hardware.microphone"
+        android:required="false" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme"
+        android:usesCleartextTraffic="true">
+        <!-- On for exactly one thing: `adb shell am start --es url http://192.168.x.x:8787/`,
+             which is how you look at this page on a real screen without rebuilding an APK. The
+             default bundle needs no cleartext at all — its own assets are served over a fake
+             https origin, and the API is wss. API 28+ defaults this to false, so leaving it
+             true has to be written down, which is also what makes it a decision instead of an
+             oversight. Note that a plain-http target has no microphone (not a secure context),
+             so that hook is for layout, not for testing a call. -->
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale"
+            android:windowSoftInputMode="adjustResize"
+            android:launchMode="singleTask">
+            <!-- configChanges is the difference between a call that survives rotating the
+                 phone and one that does not. Without it, a rotation destroys the Activity,
+                 which destroys the WebView, which closes the WebSocket — so turning the
+                 phone sideways hangs up the call. -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

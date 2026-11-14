@@ -10,10 +10,12 @@
   "scripts": {
     "start": "node server.mjs",
     "dev": "node server.mjs",
-    "check:relay": "node scripts/check-relay.mjs",
     "serve": "bash scripts/serve.sh",
-    "check:preview": "bash scripts/ensure-preview.sh",
-    "check:boot": "node scripts/check-boot.mjs"
+    "brand": "bash scripts/brand.sh",
+    "check:boot": "node scripts/check-boot.mjs",
+    "check:apk": "node scripts/check-apk.mjs",
+    "check:relay": "node scripts/check-relay.mjs",
+    "check:preview": "bash scripts/ensure-preview.sh"
   },
   "optionalDependencies": {
     "ws": "^8.23.0"

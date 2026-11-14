@@ -1,0 +1,20 @@
+// No version catalog, no dependencyLocking, no pluginManagement block pointing at a mirror:
+// two plugins and zero library dependencies do not need the ceremony, and every line of it is
+// a way for this build to stop working on a machine that differs from mine.
+pluginManagement {
+    repositories {
+        google()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode = RepositoriesMode.FAIL_ON_PROJECT_REPOS
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = 'aryans-ai-call'
+include ':app'

@@ -1,5 +1,7 @@
 # aryans-ai-call
 
+![Aryans AI Call](brand/readme-header.png)
+
 A Hinglish voice assistant you can actually talk to. Budget: **₹0**. No credit card,
 no subscription, no spare hardware.
 
@@ -229,6 +231,10 @@ firm read-aloud tone, because this is a phone call, not a narration.
 | `web/app.js` | The pipeline: capture, resample, VAD, WebSocket, playback, barge-in, tools |
 | `web/styles.css` | Mobile-first layout — a call is a phone thing |
 | `server.mjs` | Static server + optional key-holding WebSocket relay |
+| `android/` | An installable APK: the same page, in a WebView that is allowed to hold a microphone |
+| `scripts/check-apk.mjs` | Static checks for that wrapper — the Android build cannot be run here, so this is what stands in for it |
+| `scripts/brand.sh` | Regenerates every icon, the wordmarks and the card from `brand/icon-source.png` |
+| `brand/` | Generated art only; the source PNG is the single hand-made asset |
 
 Design decisions that are load-bearing, not decorative:
 
@@ -262,6 +268,62 @@ quota. For anything public, run the relay so the key stays on the server:
 npm install ws
 PROXY=1 GEMINI_API_KEY=AIza… node server.mjs
 ```
+
+## The APK
+
+`android/` builds an installable app out of the same three files in `web/`. It is a
+`WebView` and nothing else — 380 lines of Java, no Kotlin, no Compose, no dependencies —
+because a second implementation of the call screen would be a second place for the same bug
+to live.
+
+**Why bother, when the browser tab already works:** a page opened over `http://192.168.x.x:8787`
+has *no microphone at all*. `getUserMedia` is a secure-context feature, so on plain http the
+API is absent from `window` and the app cannot even report that it is missing. The APK sidesteps
+that permanently by serving its own bundle under a fake https origin
+(`https://appassets.androidplatform.net`), so the page always has a secure context, always has
+`navigator.mediaDevices`, and needs no server on your network at all. What it adds on top is the
+thing a browser cannot give you: `WebChromeClient.onPermissionRequest`, which is where the
+microphone is actually handed over.
+
+```
+adb install app-release.apk        # or just open the Release page and tap the .apk
+```
+
+- **Install from a Release.** Push a tag `v1.0` and `.github/workflows/android.yml` builds,
+  signs, and attaches the APK to a GitHub Release. The build runs there and not in the
+  sandbox: there is no JDK, Gradle or Android SDK in the dev container, and `dl.google.com`
+  is unreachable from it.
+- **One checked-in debug key, on purpose.** A key that only exists on a runner means every
+  release is signed differently, and Android refuses to install across signatures — so
+  "update the app" would become "uninstall the app", which wipes `localStorage`, which is
+  where your API key and every setting live. It is the right trade for a personal tool and
+  the wrong one for anything with users; the reasoning is in `android/app/build.gradle`.
+- **What it does not do.** No foreground service, so locking the screen stops the call — a
+  `microphone`-type service would fix it, and needs a notification and a policy for a dead
+  page; that is a build, not a flag. Back, from the call screen, ends it, for the same
+  reason: leaving a live session running behind a card in Recents would only cost you tokens.
+- **Rotation is safe.** `configChanges` in the manifest is what keeps turning the phone from
+  destroying the Activity, closing the WebSocket and hanging up on you.
+- **Audio goes through the call path.** `MODE_IN_COMMUNICATION` on resume puts Android on the
+  voice-call route — earpiece or headset, hardware echo cancellation, mic gain for a face at
+  30 cm — and restores whatever mode was there on pause. Without it the model hears its own
+  answer out of the loudspeaker and talks over itself, which is the most common cause of
+  "it keeps interrupting me" and the least likely thing to suspect, because nothing in the
+  page is wrong.
+- **The key stays yours.** The APK holds no key, has no server, and cannot ship one: an APK
+  is unsigned-stripped, unobfuscated and a three-second unzip to read. Type it once on the
+  `Key` panel; it lives in that app's `localStorage` and goes only to
+  `generativelanguage.googleapis.com`.
+- **Build it yourself:** `cd android && gradle :app:assembleRelease`. There is no wrapper jar
+  in the repo — a 43 KB binary whose only job is to download a distribution is a supply-chain
+  surface nobody reviews. Run `gradle wrapper` once if you want `./gradlew`.
+
+`scripts/check-apk.mjs` is the closest thing to a test suite the wrapper can have here: 24
+checks over manifest, Java, Gradle, theme, generated icons and the workflow, aimed at the
+failures a compiler cannot see. Both of the interesting ones were found by writing it — the
+page asks for `/styles.css` at the *root*, which a `/web/*`-only handler 404s into a black
+screen with a 200 on the document and nothing in the console. Every check is mutation-tested:
+33 one-line edits that each represent a real mistake, and each must turn the suite red.
 
 ## The phone leg — read before you plan around it
 

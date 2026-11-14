@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <!-- A plain theme, deliberately: the page draws its own chrome and the app has no
+       ActionBar to want. windowBackground matching the icon's black is what makes a cold
+       launch read as one continuous surface instead of a white flash before the WebView
+       paints — which on a slow connection is the whole first impression. -->
+  <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
+    <item name="android:windowBackground">@color/surface</item>
+    <item name="android:statusBarColor">@color/surface</item>
+    <item name="android:navigationBarColor">@color/surface</item>
+  </style>
+</resources>

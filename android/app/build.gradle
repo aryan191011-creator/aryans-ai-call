@@ -1,0 +1,131 @@
+plugins {
+    id 'com.android.application'
+}
+
+// The web client IS the app. Gradle stages web/ into a generated assets dir at build time
+// rather than keeping a second copy under app/src/main/assets, because a copied snapshot is a
+// lie that ages: six weeks later the APK ships an old app.js, and nothing in the source tree
+// says so.
+def webDir = file("$rootDir/../web")
+def genAssets = layout.buildDirectory.dir('generated/assets')
+
+android {
+    namespace 'com.aryan.aicall'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.aryan.aicall'
+        // 23 is where the runtime permission model this app relies on exists at all, and it
+        // is low enough to cover essentially any device anyone will sideload this onto.
+        minSdk 23
+        targetSdk 34
+        versionCode 1
+        versionName '1.0'
+    }
+
+    sourceSets {
+        main {
+            // Lazy on purpose: the directory does not exist until copyWebAssets runs, and
+            // .get().asFile here would resolve it at configuration time.
+            assets.srcDir genAssets
+        }
+    }
+
+    // One checked-in key, used for debug and release alike.
+    //
+    // The reason is updates, not convenience. A signing key that exists only on a CI runner
+    // means every release is signed by a different key, and Android refuses to install an APK
+    // over an existing one from a different key — so "update the app" becomes "uninstall the
+    // app", which wipes localStorage, which is where the API key and all ten panels' settings
+    // live. Sharing the key with the debug build also lets a debug APK be installed over a
+    // released one, which is the only way to reproduce on your own phone the thing you just
+    // fixed.
+    //
+    // The counter-argument is real: a private signing key is now in a git repo, so anyone who
+    // clones it can publish an update under this package id. What that buys them is a new
+    // version for people who already chose to sideload this one — no store listing, no way to
+    // read your localStorage across signatures, and no Play upload. It is the correct trade
+    // for a personal tool and the wrong one for anything with users; hence this comment.
+    signingConfigs {
+        shared {
+            storeFile file("$rootDir/debug.keystore")
+            storeType 'PKCS12'
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            shrinkResources false
+            // No R8, deliberately. Two of this app's methods exist only because the WebView
+            // finds them by name through the framework's own dispatch — onPermissionRequest and
+            // shouldInterceptRequest — and obfuscating them is how you get an APK that builds,
+            // installs, loads the page and then never asks for a microphone.
+            signingConfig signingConfigs.shared
+            debuggable false
+        }
+        debug {
+            // No applicationIdSuffix. A different id is a different app, with its own empty
+            // localStorage, so the debug build could never reproduce the one thing worth
+            // reproducing on a phone: an existing key, and a call that fails with it.
+            minifyEnabled false
+            debuggable true
+            // Overriding AGP's auto-generated ~/.android/debug.keystore is what removes the
+            // build step that shells out to keytool. That step is the usual reason "it builds
+            // on my machine" fails on a runner, and it is not a step this project needs.
+            signingConfig signingConfigs.shared
+        }
+    }
+
+    buildFeatures {
+        // AGP 8 stopped generating BuildConfig unless asked. It is asked for one constant:
+        // BuildConfig.DEBUG, which gates whether the WebView accepts a chrome://inspect
+        // connection. The release APK therefore cannot be inspected by anyone, including you.
+        buildConfig true
+    }
+
+    lint {
+        // Lint still runs and still reports; it just cannot fail a build over its opinion about
+        // a WebView wrapper's manifest. The one check that would matter here — is the mic
+        // permission paired with a runtime grant — is checked by scripts/check-apk.mjs, which
+        // can also tell you when it is not.
+        abortOnError = false
+        warningsAsErrors = false
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+tasks.register('copyWebAssets', Sync) {
+    description = 'Stages web/ into the APK assets, so the browser app and the APK are one codebase.'
+    from webDir
+    into genAssets.map { it.dir('web') }
+    // The whole directory is the asset set: a fourth file in web/ needs no edit here, which is
+    // the point. A hand-kept include list ships a page whose stylesheet was never listed — a
+    // blank screen on a phone, and it reads as an Android bug rather than a build bug.
+    //
+    // Sync, not Copy, so deleting a file from web/ deletes it from the APK too.
+    //
+    // No service worker is staged, and no secrets. A worker can keep serving a cached app.js
+    // after you fixed it, and inside a bundled WebView "reload the page" stops being a reliable
+    // answer to anything; secrets never belong in an APK, which is unsigned, unobfuscated and
+    // a three-second unzip to read.
+    exclude '**/*.map', '**/sw.js', '**/secrets*', '**/.env*'
+    inputs.dir webDir
+}
+
+// preBuild is the first task of every Android build, and wiring to it means there is no path
+// to an APK — assemble, install, bundle — that skips staging.
+tasks.named('preBuild') { dependsOn tasks.named('copyWebAssets') }
+
+dependencies {
+    // Intentionally empty. Every API this app touches is in the framework as of API 23, and
+    // each AndroidX artifact would be one more coordinate that a build machine has to be able
+    // to download before your phone can hold a microphone.
+}
