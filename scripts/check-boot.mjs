@@ -20,7 +20,12 @@ const app = fs.readFileSync(SRC, 'utf8');
 // Read alongside app.js, so any check in the file — not only the ones written near the
 // bottom — can compare the three files against each other.
 const css = fs.readFileSync(fileURLToPath(new URL('../web/styles.css', import.meta.url)), 'utf8');
-const html = fs.readFileSync(fileURLToPath(new URL('../web/index.html', import.meta.url)), 'utf8');
+// Comments are not markup, and this file treats the string as markup in three places: the fake
+// DOM's body children, the panel/id scrapes, and the nesting walk. A sentence in a comment that
+// mentions a tag ("instead of a <pre> that materialises") therefore becomes a phantom element —
+// and worse, the body scraper would happily append it to document.body. Strip first, scan after.
+const html = fs.readFileSync(fileURLToPath(new URL('../web/index.html', import.meta.url)), 'utf8')
+  .replace(/<!--[\s\S]*?-->/g, '');
 
 // ── stub DOM ───────────────────────────────────────────────────────────────
 class El {
@@ -1325,7 +1330,20 @@ check('the second failure varies the frame, since the row is now correct', () =>
   assert.notEqual(s3b, s2, 'no second retry socket');
   const setup = s3b.frames('setup')[0].setup;
   assert.equal(setup.model, 'models/gemini-3.8-live');
-  assert.equal(setup.generationConfig, undefined, 'the minimal retry must send the plain frame');
+  // This assertion used to read `setup.generationConfig === undefined` — "the plain frame
+  // has nothing in it" — and the app obeyed it for a whole release while the endpoint
+  // answered every such frame with 1007 Unknown name "responseModalities" at 'setup'.
+  // The check was written against the code, not the proto, so it pinned the bug in place.
+  // "Plain" never meant empty: it means no voice, no VAD, no transcription, no tools.
+  assert.deepEqual(setup.generationConfig, { responseModalities: ['AUDIO'] },
+    'the minimal frame must still declare AUDIO output, just where the proto keeps it');
+  assert.equal(setup.responseModalities, undefined,
+    'a generation field is sitting flat on setup again — that is the shape Google refuses');
+  for (const fancy of ['speechConfig', 'realtimeInputConfig', 'inputAudioTranscription',
+    'outputAudioTranscription', 'systemInstruction', 'tools', 'sessionResumption']) {
+    assert.equal(setup[fancy], undefined, `the "minimal" frame still carries ${fancy}`);
+    assert.equal(setup.generationConfig?.[fancy], undefined, `${fancy} leaked into generationConfig`);
+  }
 });
 
 const s3 = sockets.at(-1);
@@ -1365,7 +1383,16 @@ check('the spinner cannot last forever: deadline armed, deduped, cancelled on su
   assert.match(app, /if \(diagOnce\) return;/, 'error and close both fire: one failure must not book two retries');
   assert.match(app, /clearTimeout\(handshakeTimer\);\n\s*handshakeTries = 0;/, 'setupComplete must cancel the deadline');
   assert.match(app, /handshakeTries >= 2/, 'no cap on retries — a dead network would loop forever');
-  assert.match(app, /Stopping here rather than retrying forever/);
+  // The give-up line, checked as behaviour rather than as a phrase, so rewording it
+  // cannot silently retire the test: the branch must tell the user, must tear down, and
+  // must NOT re-print the reason the previous line already said — repeating a four-sentence
+  // paragraph in a second colour is how the dead call ended up a wall of red mono text.
+  const giveUp = /if \(handshakeTries >= 2\) \{([\s\S]*?)\n  \}/.exec(app);
+  assert.ok(giveUp, 'no give-up branch after the retry cap');
+  assert.match(giveUp[1], /note\(/, 'the user is never told the retries stopped');
+  assert.match(giveUp[1], /teardown\(\);/, 'the spinner keeps spinning after giving up');
+  assert.match(giveUp[1], /return;/, 'the give-up path falls through and retries anyway');
+  assert.doesNotMatch(giveUp[1], /note\(why/, 'the give-up line re-prints the diagnosis the line above already gave');
 });
 
 check('the failure that needs a new row opens the panel that has it', () => {
@@ -1960,6 +1987,410 @@ await endEverything();
 check('no session survives the end of the suite', () => {
   assert.match(reg.get('modePill').textContent, /idle/, 'a live call was left open');
   assert.equal(reg.get('hangup').hidden, true);
+});
+
+check('the app\u2019s own setup frames pass the app\u2019s own field audit', () => {
+  // The audit is the thing that makes a hand-added field visible instead of fatal, so it has
+  // to be silent for the frames this app actually builds. Every frame the whole suite sent is
+  // walked here, in both directions: a legal list that is too *small* would shout at correct
+  // frames, and one that is too *big* would let the shipped bug through unnoticed.
+  const log = String(reg.get('sheetLog').textContent || '');
+  assert.doesNotMatch(log, /not in the field list this build knows about/,
+    'a frame carried a field the audit does not recognise: ' + (/\[setup audit\][^\n]*/.exec(log) || [''])[0]);
+  const lists = /const SETUP_FIELDS = new Set\(\[([\s\S]*?)\]\)/.exec(app)[1];
+  const legal = [...lists.matchAll(/'([A-Za-z]+)'/g)].map((m) => m[1]);
+  for (const must of ['model', 'systemInstruction', 'tools', 'generationConfig', 'realtimeInputConfig']) {
+    assert.ok(legal.includes(must), `the audit list lost ${must}, which every call here sends`);
+  }
+  assert.equal(legal.length, 15, `the audit list is ${legal.length} long, not the 15 the converter emits — re-check it against the SDK, do not extend it from feel`);
+});
+
+// The normaliser is a safety net, so it gets tested as a unit: a net that catches nothing is
+// indistinguishable from no net at all, and every frame this app builds today happens to be
+// already-nested. The bug this pins: with no `generationConfig` object to move the field into,
+// the first version deleted the flat one — so the fallback frame lost `responseModalities`
+// silently instead of being repaired.
+check('the normaliser moves a flat field even when there is nothing to move it into', () => {
+  // JSON round-trip on every one of these: a value that crosses out of the vm context carries
+  // that realm's prototypes and strict deepEqual rejects it on an empty diff. Learned twice in
+  // one sitting, so it is written down at the second place it bit rather than the first.
+  const flat = (expr) => JSON.parse(JSON.stringify(vm.runInContext(expr, sandbox)));
+  const frame = flat('liveSetup({ model: "models/x", responseModalities: ["AUDIO"] })');
+  assert.deepEqual(frame, {
+    setup: { model: 'models/x', generationConfig: { responseModalities: ['AUDIO'] } },
+  }, 'the flat field was dropped on the floor instead of nested');
+  const both = flat('liveSetup({ model: "models/x", responseModalities: ["TEXT"], generationConfig: { responseModalities: ["AUDIO"] } })');
+  assert.deepEqual(both.setup.generationConfig.responseModalities, ['AUDIO'],
+    'a nested value was overwritten by the flat one — the nested shape is the one that reaches the API');
+  assert.equal(both.setup.responseModalities, undefined, 'the flat copy survived alongside the nested one');
+  // `{}` is what the app writes for a config with nothing in it (an empty generationConfig, an
+  // empty transcription config), so this is the path the cleanup exists for. Asserting against
+  // a frame where the object was never created would pass with the cleanup deleted — which is
+  // exactly how the first draft of this check read.
+  const none = flat('liveSetup({ model: "models/x", generationConfig: {}, systemInstruction: { parts: [{ text: "hi" }] } })');
+  assert.equal(none.setup.generationConfig, undefined,
+    'an empty generationConfig is sent as an empty object; the rest of the file assumes absent means default');
+  const emptied = flat('liveSetup({ model: "models/x", responseModalities: ["AUDIO"], generationConfig: {} })');
+  assert.ok(emptied.setup.generationConfig.responseModalities, 'the move did not land in the pre-made empty object');
+});
+
+// The audit only writes a log line, so nothing about a *frame* can prove it fired — which is
+// exactly how a warning gets quietly deleted. Call it directly and demand the effect.
+check('the audit fires on a field it does not know, and says what it will do about it', () => {
+  const before = String(reg.get('sheetLog').textContent || '');
+  const odd = vm.runInContext(
+    'auditSetup({ model: "models/x", bogusField: 1, generationConfig: { responseModalities: ["AUDIO"], nope: 2 } })',
+    sandbox,
+  );
+  // Compared as a string, not with deepEqual: a value that crosses out of the vm context
+  // carries that realm's prototypes, and a strict deepEqual against a host array fails on an
+  // audit that named every offender correctly. Seen once, paid for in a wasted half hour.
+  assert.equal(Array.from(odd).join(','), 'bogusField,generationConfig.nope',
+    'the audit named the wrong offenders: ' + JSON.stringify(Array.from(odd)));
+  const after = String(reg.get('sheetLog').textContent || '');
+  assert.notEqual(after, before, 'it computed a warning and dropped it on the floor');
+  assert.match(after, /sent anyway/, 'the line has to say the field is still being sent, or it reads as a hard failure');
+});
+
+/* ══ the setup frame, graded against the proto ═══════════════════════════════
+ * Everything in this block exists because of one screenshot: a phone showing
+ * `Unknown name "responseModalities" at 'setup': Cannot find field.` twice, then
+ * "socket closed with code 1007", then "Stopping here rather than retrying forever".
+ * The generation knobs are not fields of `setup` — they are fields of
+ * `setup.generationConfig` — and the app's own fallback frame, the one that has to
+ * survive every rejection, was the one still sending it flat. A guard that only checks
+ * the happy path guards the path that was never broken.
+ */
+check('every frame builder routes through the nesting normaliser', () => {
+  // Match the wiring, not the formatting: every frame leaves through one function, and that
+  // function calls the normaliser, the stripper and the audit. A literal one-liner here would
+  // only prove the file is still formatted the way it was when the check was written.
+  const fn = /const liveSetup = \(([\s\S]*?)\n\};/.exec(app);
+  assert.ok(fn, 'liveSetup is not the single choke point any more');
+  for (const call of ['nestGenerationFields', 'stripRefused', 'auditSetup']) {
+    assert.ok(fn[1].includes(call), `liveSetup no longer routes through ${call} — a builder can bypass it, which is how the flat field got shipped`);
+  }
+  for (const f of ['responseModalities', 'speechConfig', 'temperature', 'maxOutputTokens']) {
+    assert.ok(new RegExp(`'${f}'`).test(/const GENERATION_FIELDS = new Set\(\[([\s\S]*?)\]\)/.exec(app)[1]),
+      `GENERATION_FIELDS no longer lists ${f}, so it can go flat on setup unnoticed`);
+  }
+});
+
+check('no setup frame in the whole suite ever puts a generation field flat', () => {
+  // The real assertion: walk every frame the page actually sent, not the source text.
+  // Regex over source is what failed here last time — it can only find what you think to
+  // search for, and the bug was in a frame nobody was looking at.
+  const gen = /const GENERATION_FIELDS = new Set\(\[([\s\S]*?)\]\)/.exec(app)[1];
+  const names = [...gen.matchAll(/'([A-Za-z]+)'/g)].map((m) => m[1]);
+  assert.ok(names.length >= 6, 'GENERATION_FIELDS looks truncated: ' + names.join(','));
+  const offenders = [];
+  for (const [i, sock] of sockets.entries()) {
+    for (const f of sock.frames('setup')) {
+      const st = f.setup || {};
+      for (const n of names) if (n in st) offenders.push(`socket #${i + 1}: setup.${n}`);
+    }
+  }
+  assert.deepEqual(offenders, [], 'flat on setup (must be under setup.generationConfig): ' + offenders.join(', '));
+});
+
+// ── the production failure, reproduced from the screenshot ─────────────────
+// Three repairs, then a call that works, then one more refusal: the last one is the test of
+// whether the budget refilled, so the order is load-bearing and every step is asserted.
+await endEverything();
+reg.get('pttBtn').fire('click');
+await settle();
+
+/** Close the live socket the way Google answers a bad field name; return the retry's frame. */
+const refuseAndRetry = async (field, path = 'setup') => {
+  const sock = sockets.at(-1);
+  sock.onclose({
+    code: 1007,
+    reason: `Invalid JSON payload received. Unknown name "${field}" at '${path}': Cannot find field.`,
+  });
+  await settle();
+  const next = sockets.at(-1);
+  return next === sock ? null : next.frames('setup').at(-1)?.setup;
+};
+
+const s1007 = sockets.at(-1);
+s1007.onclose({
+  code: 1007,
+  reason: 'Invalid JSON payload received. Unknown name "responseModalities" at \'setup\': Cannot find field.',
+});
+await settle();
+
+check('a named unknown field is repaired by moving it, and keeps the voice', () => {
+  const next = sockets.at(-1);
+  assert.notEqual(next, s1007, 'a 1007 must earn a retry socket');
+  const setup = next.frames('setup')[0].setup;
+  assert.deepEqual(setup.generationConfig?.responseModalities, ['AUDIO'],
+    'the retry did not move the field where the endpoint asked for it');
+  assert.equal(setup.responseModalities, undefined, 'it retried the same rejected frame');
+  // The headline of the fix: this used to be "voice and VAD fall back to defaults". One
+  // misplaced key should not cost the user the voice they picked.
+  assert.ok(setup.generationConfig?.speechConfig, 'the repair threw away the chosen voice');
+  assert.ok(setup.systemInstruction, 'the repair threw away the persona');
+});
+
+check('the repair says what it did, once, in a sentence a caller can read', () => {
+  const t = threadText();
+  assert.match(t, /belongs under generationConfig/, 'no human explanation of the fix: ' + JSON.stringify(t.slice(0, 200)));
+  assert.equal((t.match(/Cannot find field/g) || []).length, 0,
+    'the raw protobuf string is being dumped into the transcript again');
+  assert.equal((t.match(/Setup frame refused by the endpoint/g) || []).length, 1,
+    'the same diagnosis printed twice — the screenshot had it in two boxes');
+  assert.ok(reg.get('say').textContent.length < 60,
+    'the headline under the orb turned into a paragraph: ' + reg.get('say').textContent);
+});
+
+check('the raw response is kept, where it is useful and out of the way', () => {
+  const log = reg.get('sheetLog');
+  assert.ok(log.textContent.includes('Cannot find field'),
+    'the field path is the thing a bug report needs — it belongs in the log, not the call screen');
+  assert.match(log.textContent, /\[setup repair\] setup\.responseModalities/);
+});
+
+const fSys = await refuseAndRetry('systemInstruction');
+const fSpeech = await refuseAndRetry('speechConfig', 'setup.generationConfig');
+
+check('a refusal two levels deep removes that key and leaves its siblings alone', () => {
+  assert.ok(fSpeech, 'no retry after a refusal at setup.generationConfig.speechConfig');
+  assert.equal(fSpeech.generationConfig?.speechConfig, undefined, 'the refused key was re-sent');
+  assert.deepEqual(fSpeech.generationConfig?.responseModalities, ['AUDIO'],
+    'refusing one key cleared the whole generationConfig — the voice went with it');
+});
+
+check('the second repair drops the field it was named, not the config around it', () => {
+  assert.ok(fSys, 'no retry after the second refusal');
+  assert.equal(fSys.systemInstruction, undefined, 'systemInstruction was refused and is still being offered');
+  assert.ok(fSys.tools, 'the repair kept deleting past the field it was told about');
+});
+
+// Now earn the budget back: connect this call, hang it up, and start a fresh one. `refused`
+// deliberately survives a connect (that row was seen to reject those keys), so the fresh call
+// must still be able to *repair* — which only happens if fieldRepairs went back to zero.
+sockets.at(-1).from({ setupComplete: {} });
+await settle(80);
+await endEverything();
+reg.get('pttBtn').fire('click');
+await settle();
+const afterConnect = await refuseAndRetry('outputAudioTranscription');
+
+check('a refusal on a fresh call is repaired by name, not escalated', () => {
+  // What this can honestly claim: the ladder is still alive on a call that starts after a
+  // successful one. The budget refills on a connect *and* on a row change (repairField), and
+  // this scenario sees both, so it cannot isolate the reset — the "moved twice" check below
+  // is what catches a missing refill. Anything stronger would be a check that passes because
+  // two different failures look the same.
+  assert.ok(afterConnect, 'the ladder was spent even though the call had connected since');
+  assert.equal(afterConnect.outputAudioTranscription, undefined,
+    'the named field was not the thing that got dropped');
+  assert.ok(afterConnect.inputAudioTranscription,
+    'this is the minimal frame, not a repaired full frame — the ladder gave up instead of fixing one field');
+  assert.deepEqual(afterConnect.generationConfig?.responseModalities, ['AUDIO']);
+  assert.equal(afterConnect.systemInstruction, undefined,
+    'a field this row refused came back on the next call');
+  // The frame shape alone cannot prove the ladder ran — a minimal frame also lacks most of
+  // these keys, and a check that passes because two different failures look the same is not a
+  // check. The repair sentence names the field, which nothing else in the app can print.
+  assert.match(threadText(), /does not accept "outputAudioTranscription"/,
+    'no repair was attempted on this call: the budget was never refilled by the connect');
+  assert.doesNotMatch(threadText(), /minimal setup frame/,
+    'fell back to the minimal frame while there was still a specific field to fix');
+});
+
+/**
+ * Phase C: the server contradicts a move. `responseModalities` is now only ever sent nested,
+ * so a refusal of it *at setup* means the ladder's advice did not work, and repeating the
+ * advice is not a second idea — it is a loop that re-sends an identical frame until the cap
+ * runs out. A field that has been moved and refused again has to be retired in both places.
+ */
+const fContradiction = await refuseAndRetry('responseModalities');
+check('a moved field that is refused again is retired, not moved a second time', () => {
+  assert.ok(fContradiction, 'the contradiction got no retry at all');
+  assert.equal(fContradiction.responseModalities, undefined, 'still flat on setup');
+  assert.equal(fContradiction.generationConfig?.responseModalities, undefined,
+    'the same move was tried twice — an identical frame, resent forever');
+  assert.ok(fContradiction.inputAudioTranscription,
+    'it stopped being a full frame; the ladder gave up instead of retiring one field');
+  assert.equal((threadText().match(/Moved it there/g) || []).length, 1,
+    'the app repeated its own advice instead of escalating past it');
+});
+
+/**
+ * The presentation rule the screenshot broke: a failure gets one sentence in one box, and the
+ * wire text goes under a disclosure. Driven by a 401, because that is the other error this app
+ * can be handed that arrives as somebody else's prose.
+ */
+/**
+ * The presentation rule the screenshot broke: one failure, one sentence, one box, and the wire
+ * text under a disclosure. Driven by a 401 because that is the other error this app is handed as
+ * somebody else's prose. Scoped to the nodes this scenario added — the transcript deliberately
+ * survives a reconnect, so "the last error note" is not the same thing as "the only one".
+ */
+await endEverything();
+const sockBefore = sockets.length;
+reg.get('pttBtn').fire('click');
+await settle(80);
+const kidsBefore = (reg.get('thread').children || []).length;
+assert.ok(sockets.length > sockBefore, 'the scenario could not open a call to break');
+sockets.at(-1).from({ setupError: { message: 'API key not valid. Please pass a valid API key.' } });
+await settle(120);
+
+const allText = (n) => [String(n.textContent || ''), ...(n.children || []).flatMap(allText)].join('\n');
+const since = (cls) => (reg.get('thread').children || []).slice(kidsBefore)
+  .filter((c) => new RegExp(`(^|\\s)${cls}(\\s|$)`).test(String(c.className)));
+
+check('the red box holds a sentence, never the API prose', () => {
+  // No `sockets.length` guard needed: the top-level assert above already proved this scenario
+  // opened a call, and `from()` delivers to that socket's onmessage or the app never saw it.
+  const errs = since('err');
+  assert.ok(errs.length >= 1, 'a 401 printed no error line at all');
+  for (const n of errs) {
+    assert.doesNotMatch(String(n.textContent), /API key not valid|Unknown name|Cannot find field|1007/,
+      'the visible error is the wire string: ' + JSON.stringify(String(n.textContent).slice(0, 90)));
+  }
+  assert.match(String(errs.at(-1).textContent), /does not accept that key/i,
+    'the sentence lost the one thing worth saying: ' + errs.at(-1).textContent);
+  assert.ok(String(errs.at(-1).textContent).length < 150, 'the sentence is a paragraph again');
+});
+
+check('the raw response survives, folded, and printed once', () => {
+  const raws = since('raw');
+  assert.equal(raws.length, 1, 'expected one disclosure from this failure, got ' + raws.length);
+  const det = (raws[0].children || [])[0];
+  assert.equal(det?.tag, 'details', 'the raw text is not behind a disclosure');
+  const [sum, pre] = det.children || [];
+  assert.match(String(sum.textContent), /technical detail/);
+  assert.match(String(pre.textContent), /API key not valid/, 'the payload was thrown away, not folded');
+  const inThisFailure = (reg.get('thread').children || []).slice(kidsBefore).map(allText).join('\n');
+  const once = (inThisFailure.match(/API key not valid/g) || []).length;
+  assert.equal(once, 1, `the same string on screen ${once} times — it was in two boxes before`);
+  assert.match(reg.get('sheetLog').textContent, /API key not valid/, 'the copyable log lost it');
+});
+
+/* ══ the fallback branch, where un-named wire prose actually arrives ═════════
+ * Every specific error has a sentence of its own. The risk lives in the `else`, which is
+ * where a message this file has never seen lands — and where an earlier version printed the
+ * whole payload as the user-facing text.
+ */
+await endEverything();
+reg.get('pttBtn').fire('click');
+await settle(80);
+const kidsUnk = (reg.get('thread').children || []).length;
+sockets.at(-1).from({
+  setupError: { message: 'Internal error encountered while preparing the model: upstream_deadline_exceeded (req 0x1f) trace 8a:2144' },
+});
+await settle(120);
+
+check('an error with no branch of its own still keeps the wire prose out of the red box', () => {
+  const errs = (reg.get('thread').children || []).slice(kidsUnk)
+    .filter((c) => /(^|\s)err(\s|$)/.test(String(c.className)));
+  assert.ok(errs.length >= 1, 'the unknown error printed no line at all');
+  for (const n of errs) {
+    assert.doesNotMatch(String(n.textContent), /upstream_deadline_exceeded|0x1f|trace 8a|Internal error encountered/,
+      'the app echoed the API prose at the caller: ' + JSON.stringify(String(n.textContent).slice(0, 100)));
+    assert.ok(String(n.textContent).length < 170, 'an unrecognised failure must not become a paragraph');
+  }
+  assert.match(String(errs.at(-1).textContent), /does not know how to read/,
+    'the sentence does not admit what it does not know: ' + errs.at(-1).textContent);
+  const raw = (reg.get('thread').children || []).slice(kidsUnk)
+    .filter((c) => /(^|\s)raw(\s|$)/.test(String(c.className)));
+  assert.equal(raw.length, 1, 'the payload should be folded under exactly one disclosure');
+  assert.match((raw[0].children || []).flatMap((d) => (d.children || []).map((x) => String(x.textContent))).join(' '),
+    /upstream_deadline_exceeded/, 'the folded copy lost the string a bug report needs');
+  assert.match(reg.get('sheetLog').textContent, /upstream_deadline_exceeded/);
+});
+
+check('the failure that needs a new key opens the panel that has it', () => {
+  assert.equal(reg.get('p-key').hidden, false, '401 says "check the key" without showing the key box');
+  assert.ok(reg.get('say').textContent.length < 60, 'the orb headline grew into a paragraph');
+});
+
+/* ══ the technical log: folded, cumulative, copyable ══════════════════════════
+ * The log is the one place raw text is allowed to be raw. Three things go wrong without
+ * looking: a writer forgets to reveal it, "Test connection" replaces it, and a copy button
+ * built on navigator.clipboard does nothing on the WebView (plain http = insecure context,
+ * no clipboard API at all).
+ */
+check('one function owns the log, so revealing it cannot be forgotten', () => {
+  const hiddenWrites = [...app.matchAll(/el\.sheetLog\.hidden\s*=/g)].length;
+  assert.equal(hiddenWrites, 0, 'a call site still toggles the log panel by hand');
+  const reveal = [...app.matchAll(/el\.logBox\.hidden\s*=/g)];
+  assert.equal(reveal.length, 1, 'the reveal must live in exactly one place, saw ' + reveal.length);
+  const writers = [...app.matchAll(/el\.sheetLog\.textContent\s*\+=/g)].length;
+  assert.equal(writers, 1, 'log text is being appended outside logLine, which is where the count lives');
+  assert.match(app, /logLine\(/, 'logLine is never called');
+});
+
+check('the box counts its lines, so it says whether it is worth opening', () => {
+  const lines = Number(reg.get('sheetLog').getAttribute('data-lines'));
+  assert.ok(lines >= 1, 'log lines were written but nothing counted them');
+  // Written out, not computed with a ternary whose branches were identical — a check that
+  // happens to agree with the code is not a check that reads the code.
+  const want = lines === 1 ? '1 line' : lines + ' lines';
+  assert.equal(reg.get('logCount').textContent.trim(), want,
+    `the summary says "${reg.get('logCount').textContent.trim()}", the log holds ${lines} (${want})`);
+  assert.equal(reg.get('logBox').hidden, false, 'lines exist but the box is still hidden');
+});
+
+check('“Test connection” adds to the log instead of replacing the evidence', () => {
+  const before = String(reg.get('sheetLog').textContent);
+  assert.match(before, /API key not valid|upstream_deadline_exceeded/,
+    'the scenario needs a failure in the log first to mean anything');
+  reg.get('sheetTest').fire('click');
+  assert.notEqual(String(reg.get('sheetLog').textContent), before, 'the probe did not write at all');
+  assert.ok(String(reg.get('sheetLog').textContent).startsWith(before.trim().slice(0, 40)),
+    'the probe wiped the trail — the line a bug report needs is gone');
+  assert.ok(String(reg.get('probeOut').textContent).length > 0, 'no answer shown next to the button');
+  assert.ok(String(reg.get('probeOut').textContent).length < 130,
+    'the answer under the buttons grew into the report again: ' + reg.get('probeOut').textContent.length + ' chars');
+});
+
+check('the probe is coloured by its verdict, not by its wording', () => {
+  // Two states that must not look the same: "here is what your key can see, and your row is
+  // among them" and "your row is missing". The first version of this read the sentence and
+  // called everything red, which is the mistake of styling a status line by string-matching
+  // the status line.
+  const kind = String(reg.get('probeOut').dataset.kind || '');
+  assert.ok(['ok', 'bad', 'wait'].includes(kind), 'probe state is not one of the three: ' + kind);
+  for (const k of ['ok', 'bad', 'wait']) {
+    assert.ok(new RegExp(`\\[data-kind="${k}"\\]`).test(css), `.probe[data-kind="${k}"] has no rule — that state renders unstyled`);
+  }
+  assert.match(css, /\.probe\[data-kind="bad"\][^{]*\{[^}]*--danger/, 'the bad verdict is not the danger colour');
+  assert.match(css, /\.probe\[data-kind="ok"\][^{]*\{[^}]*--you/, 'the good verdict hard-codes a green that light mode will not forgive');
+  // `var(--ok` is the failure mode: a token that does not exist resolves to nothing and the
+  // rule silently stops applying. Named in a comment does not count, however tempting the
+  // prose — this check flagged my own sentence explaining it, which is the right behaviour
+  // for a scanner and the wrong thing to assert about.
+  assert.doesNotMatch(css, /var\(--ok[,)]/, 'the palette has no --ok token; use --you');
+});
+
+check('copy works where there is no clipboard API, and says so either way', () => {
+  // This sandbox has neither navigator.clipboard nor document.execCommand — which is exactly
+  // the WebView over http, the primary place this app runs. A button that only handles the
+  // API path would pass a laptop test and be a no-op on the phone.
+  assert.doesNotMatch(String(sandbox.navigator.clipboard || ''), /writeText/, 'the harness grew a clipboard; this check no longer covers the degraded path');
+  reg.get('logCopy').fire('click');
+  const label = String(reg.get('logCopy').textContent);
+  assert.match(label, /copied|hold/, 'the copy button went quiet: ' + JSON.stringify(label));
+  assert.ok(!/\[object Object\]|undefined|null/.test(label), 'the label printed an object: ' + label);
+  if (/hold/.test(label)) {
+    assert.equal(reg.get('sheetLog').getAttribute('tabindex'), '0',
+      'telling someone to hold the text only works if the text can be selected');
+  }
+});
+
+check('one field gets one repair, and the ladder is capped', () => {
+  const cap = Number(/const MAX_FIELD_REPAIRS = (\d+);/.exec(app)[1]);
+  assert.ok(cap >= 2 && cap <= 6, `a repair cap of ${cap} is either a loop or a dead end`);
+  const strip = /function stripRefused\([\s\S]*?\n\}/.exec(app)[0];
+  assert.match(strip, /refusedFor !== cfg\.model/,
+    'a field refused by one row must not be muted for every row forever');
+  assert.match(strip, /for \(const seg of segs\)/,
+    'stripRefused only knows two depths again, so a nested refusal is remembered but re-sent');
+  const repair = /function repairField\([\s\S]*?\n\}/.exec(app)[0];
+  assert.match(repair, /movedAway/, 'the move is unbounded: move, refuse, move again, forever');
 });
 
 // A suite that cannot finish must not look like a suite that passed. An early exit —

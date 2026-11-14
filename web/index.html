@@ -88,7 +88,8 @@
   <form class="composer" id="textForm">
     <label class="sr-only" for="textInput">Send a message to the agent instead of speaking</label>
     <input id="textInput" type="text" autocomplete="off" maxlength="500"
-           placeholder="Type instead — the agent answers out loud" />
+           placeholder="Type instead — it answers aloud"
+           aria-label="Type instead — the agent answers out loud" />
     <button class="send" type="submit" aria-label="Send message">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 12 16-8-6 8 6 8-16-8Z"/></svg>
     </button>
@@ -397,7 +398,19 @@
       <button id="sheetTest" class="ghost">Test connection</button>
       <button id="sheetClose" class="ghost">Close</button>
     </div>
-    <pre id="sheetLog" class="log" hidden></pre>
+    <!-- One folded box for everything machine-shaped, instead of a <pre> that materialises
+         under the buttons the moment something goes wrong. It is here because a person
+         filing a bug needs the exact text, and it is folded because a person on a call does
+         not. Copy is a button, not "select it with your thumb". -->
+    <p class="probe" id="probeOut" role="status" aria-live="polite" hidden></p>
+    <details class="logbox" id="logBox" hidden>
+      <summary>Technical log<span class="logcount" id="logCount"></span></summary>
+      <div class="logbar">
+        <button id="logCopy" class="ghost sm" type="button">Copy for a bug report</button>
+        <button id="logClear" class="ghost sm" type="button">Clear</button>
+      </div>
+      <pre id="sheetLog" class="log"></pre>
+    </details>
   </div>
 </div>
 

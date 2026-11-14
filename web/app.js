@@ -187,7 +187,9 @@ const el = {
   inBar: $('inBar'), outBar: $('outBar'), sTurnLat: $('sTurnLat'), sSpread: $('sSpread'),
   sRecv: $('sRecv'), sCalls: $('sCalls'), sTokens: $('sTokens'), pttBtn: $('pttBtn'), pttLabel: $('pttLabel'),
   ptt: $('pushToTalk'), muteBtn: $('muteBtn'), hangup: $('hangup'), sheet: $('sheet'),
-  sheetLog: $('sheetLog'), keyWarn: $('keyWarn'), gear: $('gearBtn'),
+  sheetLog: $('sheetLog'), logBox: $('logBox'), logCount: $('logCount'), logCopy: $('logCopy'),
+  logClear: $('logClear'), probeOut: $('probeOut'),
+  keyWarn: $('keyWarn'), gear: $('gearBtn'),
   textForm: $('textForm'), textInput: $('textInput'),
 };
 
@@ -235,6 +237,110 @@ const note = (msg, kind = 'sys') => {
   el.thread.append(d);
   stick();
 };
+
+/**
+ * Turn a wire error into a sentence.
+ *
+ * A phone call that has failed does not need the API's prose: it needs to know whose fault
+ * this looks like and what to do next. The raw string is not thrown away — `noteError` keeps
+ * it under a collapsed disclosure and the settings log keeps it for a bug report — but it is
+ * no longer the loudest thing on screen. This exists because a screenshot of this app showed
+ * ten lines of red monospace protobuf (`Unknown name "responseModalities" at 'setup': Cannot
+ * find field.`) as the entire user-facing error, twice, on a 6-inch screen.
+ */
+function humanError(raw) {
+  const msg = String(raw || '').trim();
+  if (!msg) return 'Something went wrong, and the endpoint had nothing to say about it.';
+  const unknown = unknownFieldOf(msg);
+  if (unknown) return `This row does not recognise the config field "${unknown.field}".`;
+  if (/1007|Invalid JSON payload/i.test(msg)) return 'The endpoint refused the request format, so the call never started.';
+  if (/401|UNAUTHENTICATED|API key not valid|invalid.*key/i.test(msg)) return 'Google does not accept that API key — check it was pasted whole, with no space at the end.';
+  if (/403|PERMISSION_DENIED|hasn't used project/i.test(msg)) return 'This key is not allowed to reach that row for this project.';
+  if (/RESOURCE_EXHAUSTED|429|quota/i.test(msg)) return 'Free-tier quota is used up for now.';
+  if (/404|NOT_FOUND|no such model|unsupported/i.test(msg)) return 'That model row is not available to this key.';
+  if (/network|ERR_|Failed to fetch|dns|enotfound|timed? ?out/i.test(msg)) return 'The request never got to Google — this looks like the network, not the key.';
+  if (/1006|closed before it opened|socket error/i.test(msg)) return 'The line dropped before the call could start.';
+  if (/media|getUserMedia|permission denied.*microphone|notallowed/i.test(msg)) return 'The microphone refused to open.';
+  // Nothing recognised. Do NOT echo the message: cutting machine prose at the first full stop
+  // is a shorter stack trace, not a diagnosis, and on a phone it is still the loudest thing on
+  // the screen. Say what is known — the endpoint answered, so the network is fine and the key
+  // got through — and where the detail went.
+  if (/^socket closed|^the Live socket|^the live socket/i.test(msg)) {
+    return 'The line to Google dropped before the call could start.';
+  }
+  return 'The endpoint answered with something this app does not know how to read. Your key and your network are both fine — it got that far.';
+}
+
+/** One failure, one place: a sentence you can act on, with the raw text under it. */
+function noteError(human, raw, kind = 'err') {
+  note(human, kind);
+  if (!raw) return;
+  el.empty?.remove();
+  const d = document.createElement('div');
+  d.className = 'note raw';
+  const det = document.createElement('details');
+  const sum = document.createElement('summary');
+  sum.textContent = 'technical detail';
+  const pre = document.createElement('pre');
+  pre.textContent = String(raw).slice(0, 2000);
+  det.append(sum, pre);
+  d.append(det);
+  el.thread.append(d);
+  // The raw payload belongs in the log, where a bug report can copy it — and only there.
+  // Appending it to the transcript *as well* is what put the same string on screen twice.
+  logLine(raw);
+  stick();
+}
+
+/**
+ * Append one line to the technical log and make the box visible.
+ *
+ * Every writer used to remember `hidden = false` on its own, and the ones that forgot left a
+ * log that existed but could not be seen. The count in the summary is there so the box says how
+ * much is in it before you open it — "3 lines" is a reason to look, an empty triangle is not.
+ */
+let logLines = 0;
+function logLine(text) {
+  el.sheetLog.textContent += `\n[${new Date().toISOString().slice(11, 19)}] ${String(text).slice(0, 600)}`;
+  logLines++;
+  el.sheetLog.setAttribute('data-lines', String(logLines));
+  if (el.logCount) el.logCount.textContent = ` ${logLines} line${logLines === 1 ? '' : 's'}`;
+  if (el.logBox) el.logBox.hidden = false;
+}
+
+/**
+ * Copy the log. On the WebView this app ships in, the page is served over plain http, so
+ * `navigator.clipboard` does not exist at all — an insecure context — and a copy button built
+ * only on that API is a button that works on a laptop and fails on the phone that needs it.
+ * So: clipboard if there is one, a selection the user can copy themselves if there is not,
+ * and never a silent no-op.
+ */
+async function copyLog() {
+  const text = String(el.sheetLog.textContent || '').trim();
+  if (!text) { el.logCopy.textContent = 'nothing to copy yet'; return; }
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      el.logCopy.textContent = 'copied ✓';
+      return;
+    }
+  } catch {}
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.className = 'sr-only';
+    document.body.append(ta);
+    ta.select();
+    const ok = document.execCommand && document.execCommand('copy');
+    ta.remove();
+    if (ok) { el.logCopy.textContent = 'copied ✓'; return; }
+  } catch {}
+  // Last resort, and an honest one: put the text where a long-press will grab it.
+  el.sheetLog.setAttribute('tabindex', '0');
+  el.sheetLog.focus?.();
+  el.logCopy.textContent = 'press and hold the text to copy';
+}
 
 // Transcriptions arrive incrementally, so each bubble accumulates rather than
 // being replaced. The user bubble closes when the agent starts talking; the
@@ -603,7 +709,10 @@ function downloadAudition() {
     // A browser or embed that refuses a programmatic download: say so, and leave the
     // button doing something the next time.
     if (btn) btn.textContent = 'This browser will not save a file from the page — play it instead';
-    note(`Could not save the sample: ${e.message}. Press ▶ Hear this voice to play it.`, 'err');
+    // The button right above already carries the remedy, so the note does not repeat it; the
+    // browser's complaint goes in the log, where it can be read if "play it instead" is not
+    // enough. One sentence, one remedy, per failure — the whole rule this pass is about.
+    noteError('This browser refused to save the sample — it is still playing fine above.', e.message);
   }
 }
 
@@ -743,7 +852,7 @@ async function audition() {
   function fail(msg) {
     // Never throw the user into a dead button: say what failed and why, and what to press.
     if (log) log.textContent = `Audition failed: ${msg}`;
-    note(`Audition failed: ${msg}`, 'err');
+    noteError('The voice preview could not start. Nothing you changed is broken — the detail is folded below.', msg);
   }
 }
 
@@ -1023,7 +1132,150 @@ function sendAudio(int16) {
  *    richer fields (transcription biasing, resumption, always-answer) only go to rows
  *    that document them.
  */
-const liveSetup = (setup) => ({ setup });
+/**
+ * Which half of the setup frame a field belongs to.
+ *
+ * `BidiGenerateContentSetup` is one proto with two levels: the generation knobs go under
+ * `generationConfig`, everything else sits flat on `setup`. Both the docs and the SDK's own
+ * converters agree on this split, and getting it wrong is not a warning — the endpoint answers
+ * with a 1007 close whose reason is `Unknown name "responseModalities" at 'setup': Cannot find
+ * field.`, and the call never starts. This file shipped exactly that bug in `minimalSetup`,
+ * which passed `responseModalities` flat: the frame that exists to *survive* a rejection was
+ * itself the thing being rejected, so a session that degraded once could never connect again
+ * for the rest of the page load.
+ */
+const GENERATION_FIELDS = new Set([
+  'responseModalities', 'speechConfig', 'temperature', 'topP', 'topK', 'maxOutputTokens',
+  'mediaResolution', 'seed', 'thinkingConfig', 'enableAffectiveDialog', 'translationConfig',
+]);
+
+/**
+ * The other half of the split: what may sit flat on `setup` at all.
+ *
+ * Verified against the wire by reading the converter in google-genai 3.3.0
+ * (`_LiveConnectConfig_to_mldev`), which is the list Google's own client emits — not against
+ * a memory of the docs page, which is how the last attempt at this went wrong. A warning from
+ * here is not a verdict: rows gain fields faster than this file learns them, so an unknown name
+ * is logged and *still sent*, and the repair ladder is what actually reacts if the endpoint
+ * disagrees. The point is that a field added by mistake shows up in ⚙ on the first call instead
+ * of arriving as a dead socket blamed on the key.
+ */
+const SETUP_FIELDS = new Set([
+  'model', 'systemInstruction', 'tools', 'safetySettings', 'realtimeInputConfig',
+  'sessionResumption', 'labels', 'historyConfig', 'inputAudioTranscription',
+  'outputAudioTranscription', 'proactivity', 'avatarConfig', 'explicitVadSignal',
+  'contextWindowCompression', 'generationConfig',
+]);
+
+function auditSetup(setup) {
+  const odd = Object.keys(setup).filter((k) => !SETUP_FIELDS.has(k));
+  for (const k of Object.keys(setup.generationConfig || {})) {
+    if (!GENERATION_FIELDS.has(k)) odd.push(`generationConfig.${k}`);
+  }
+  if (odd.length) {
+    logLine(`[setup audit] ${odd.map((k) => `\`${k}\``).join(', ')} ${odd.length === 1 ? 'is' : 'are'} not in the field list this build knows about — sent anyway; if the call dies, that is the suspect`);
+  }
+  return odd;
+}
+
+/** Fields this row has refused, and the row they were refused by. */
+let refused = new Set();
+let refusedFor = '';
+let fieldRepairs = 0;
+const MAX_FIELD_REPAIRS = 3;
+// A move is tried once per field. If a field is still refused after being nested where it
+// belongs, escalating to dropping it is the only honest step left — and repeating the same
+// repair would be a retry loop wearing a ladder's clothes.
+const movedAway = new Set();
+
+/** `Unknown name "X" at 'setup.generationConfig': Cannot find field.` → { field, path }. */
+function unknownFieldOf(msg) {
+  const m = /Unknown name "([A-Za-z_][\w.]*)"(?:\s+at '([\w.]*)')?/.exec(String(msg || ''));
+  return m ? { field: m[1], path: m[2] || 'setup' } : null;
+}
+
+const refusalKey = (info) => `${info.path || 'setup'}.${info.field}`;
+
+/**
+ * Put every generation knob where the proto says it goes, whatever the caller wrote.
+ *
+ * Done on the way out, in one place, for both the call and the audition, so the rule cannot be
+ * broken by a frame builder again. An existing value under `generationConfig` wins: a caller
+ * that already nested `speechConfig` and also left a flat copy is stating a preference twice,
+ * and the nested one is the one that reaches the API.
+ */
+function nestGenerationFields(setup) {
+  for (const f of Object.keys(setup)) {
+    if (f === 'generationConfig' || !GENERATION_FIELDS.has(f)) continue;
+    // Created on the way past, not assumed: the whole reason this function exists is the
+    // caller that put `responseModalities` flat with no generationConfig to put it in. Copy
+    // only when the target is empty — a caller that states a thing twice means the nested one.
+    const gen = (setup.generationConfig ||= {});
+    if (gen[f] === undefined) gen[f] = setup[f];
+    delete setup[f];
+  }
+  if (setup.generationConfig && Object.keys(setup.generationConfig).length === 0) {
+    delete setup.generationConfig;
+  }
+  return setup;
+}
+
+/**
+ * Drop what this row has already said it does not accept, provided it is still this row.
+ *
+ * The remembered key is the full path the server gave back — `setup.responseModalities`,
+ * `setup.generationConfig.speechConfig`, `setup.outputAudioTranscription.wordTimestamp` — so
+ * walk it instead of special-casing the two levels that happened to be handy. A refusal at any
+ * depth is otherwise remembered but re-sent forever, and the ladder's last resort becomes
+ * "stop trying", which is exactly where a user gives up on a voice app.
+ */
+function stripRefused(setup) {
+  if (refusedFor !== cfg.model || refused.size === 0) return setup;
+  for (const key of refused) {
+    const segs = key.split('.');
+    if (segs.shift() !== 'setup' || segs.length === 0) continue;
+    const leaf = segs.pop();
+    let node = setup;
+    for (const seg of segs) node = node && typeof node === 'object' ? node[seg] : null;
+    if (node && typeof node === 'object') delete node[leaf];
+  }
+  return setup;
+}
+
+/**
+ * One repair step for a named field, and the sentence that says what was done.
+ *
+ * The sentence matters as much as the fix: "voice and VAD fall back to defaults" is what the
+ * old code said when all it really needed to do was move one field, and it taught the user that
+ * their settings get thrown away whenever Google renames something.
+ */
+function repairField(info, raw) {
+  if (refusedFor !== cfg.model) { refusedFor = cfg.model; refused.clear(); fieldRepairs = 0; movedAway.clear(); }
+  const key = refusalKey(info);
+  let said;
+  if (info.path === 'setup' && GENERATION_FIELDS.has(info.field) && !movedAway.has(info.field)) {
+    movedAway.add(info.field);
+    said = `"${info.field}" belongs under generationConfig, not flat on setup. Moved it there — nothing you set in ⚙ is being dropped.`;
+  } else {
+    refused.add(key);
+    if (info.path === 'setup' && GENERATION_FIELDS.has(info.field)) {
+      // The move was tried and the field was refused at `setup` again, which means the two
+      // locations are being read as one by something that disagrees with us. Stripping only
+      // the path named in the error would produce a byte-identical next frame — a retry loop
+      // that cannot terminate. Retire the field everywhere it could live.
+      refused.add(`setup.generationConfig.${info.field}`);
+    }
+    said = `This row does not accept "${info.field}" at ${info.path}. That one field is off for this row; voice, VAD and captions stay exactly as you set them.`;
+  }
+  logLine(`[setup repair] ${key} — ${raw || ''}`.trimEnd());
+  return said;
+}
+
+const liveSetup = (setup) => {
+  const frame = stripRefused(nestGenerationFields(setup));
+  auditSetup(frame);
+  return { setup: frame };
+};
 
 function fullSetup() {
   const capableRow = capable(cfg.model);
@@ -1105,7 +1357,14 @@ function fullSetup() {
   }
   return liveSetup(setup);
 }
-const minimalSetup = () => liveSetup({ model: cfg.model, responseModalities: ['AUDIO'] });
+// Nested on purpose, and not only because liveSetup would fix it: this is the frame that has to
+// work when everything fancier was refused, so it is written in the shape the endpoint actually
+// takes rather than the shape that used to. No voiceConfig, no transcription, no tools — that is
+// what "minimal" means — but `responseModalities` is not optional, and neither is its parent.
+const minimalSetup = () => liveSetup({
+  model: cfg.model,
+  generationConfig: { responseModalities: ['AUDIO'] },
+});
 
 /**
  * One throwaway Live socket, no mic: used by the voice audition so the sample is
@@ -1147,7 +1406,7 @@ function openCallSocket(reason) {
     // stayed on "connecting" forever.
     setMode('error', 'error');
     el.say.textContent = 'Connect failed.';
-    note(`Could not open the socket at all: ${e.message}`, 'err');
+    noteError('Could not open the socket at all — the address this page is calling is not usable.', e.message);
     return false;
   }
   armHandshake();
@@ -1257,6 +1516,12 @@ function onMessage(ev) {
     settled = true;
     clearTimeout(handshakeTimer);
     handshakeTries = 0;
+    // A connect that worked is the only evidence worth resetting on: the budget is per
+    // run of failures, not per page load, or a mid-call rotation that tripped one repair
+    // would leave the next hour of calls with no ladder at all. `refused` deliberately
+    // survives — that row was seen to reject the field, and re-offering it every call
+    // would re-earn the same 1007 every time.
+    fieldRepairs = 0;
     if (pendingModelFix) {
       // The row that actually connected is worth keeping; the one in the file is a
       // guess about what Google shipped when it was written.
@@ -1456,16 +1721,29 @@ function onMessage(ev) {
     if (el.sTokens) el.sTokens.textContent = stats.tokens >= 10000 ? (stats.tokens / 1000).toFixed(0) + 'k' : String(stats.tokens);
   }
   if (m.setupError || m.error) reportError(m.setupError || m.error);
-  if (m.relayError) note(`relay: ${m.relayError.reason || m.relayError.code}`, 'err');
+  if (m.relayError) noteError(`This page's own relay reported a problem: ${m.relayError.reason || m.relayError.code}`, JSON.stringify(m.relayError));
 }
 
 function reportError(err) {
   const msg = err?.message || JSON.stringify(err);
+  // Same repair ladder as the close-code path, because the same refusal arrives either way —
+  // sometimes as a setupError message on a live socket, sometimes as a 1007 that kills it.
+  // One ladder, two entrances, or the fix works in one case and not the other.
+  const bad = unknownFieldOf(msg);
+  if (bad && fieldRepairs < MAX_FIELD_REPAIRS && !refused.has(refusalKey(bad))) {
+    fieldRepairs++;
+    note(`Setup refused — ${repairField(bad, msg)}`, 'sys');
+    const k = cfg.key;
+    teardown();
+    cfg.key = k;
+    setTimeout(start, 500);
+    return;
+  }
   if (!triedMinimal && /speechConfig|realtimeInputConfig|transcription|Unknown name|Invalid JSON/i.test(msg)) {
-    // Field-name churn between model generations. Degrade to the one shape
-    // every Live model accepts rather than dying on a config we cannot verify.
+    // Field-name churn between model generations, with no field named to aim at. Degrade to
+    // the one shape every Live model accepts rather than dying on a config we cannot verify.
     triedMinimal = true;
-    note('Config fields rejected → retrying with minimal setup (voice/VAD go default).', 'sys');
+    note('The endpoint refused the richer config fields, so the call is running on the plain one. Voice and pause-detection go to that row’s defaults.', 'sys');
     // Full teardown first: connect() reopens the mic, and leaving the old
     // MediaStream + AudioContext alive leaks the recorder and stacks graphs.
     const k = cfg.key;
@@ -1477,19 +1755,26 @@ function reportError(err) {
     setTimeout(start, 500);
     return;
   }
+  // Each branch says the thing a caller can act on, and only then keeps the raw text folded
+  // under it. The previous version put `msg` in the transcript AND the sheet log, which is how
+  // one protobuf complaint ended up on screen twice.
   if (/RESOURCE_EXHAUSTED|429|quota/i.test(msg)) {
-    note('Free-tier quota hit for today. That is the ₹0 ceiling — wait for the day to roll, or use a second project.', 'err');
+    noteError('Free-tier quota hit for today. That is the ₹0 ceiling — wait for the day to roll, or use a second project.', msg);
   } else if (/NOT_FOUND|404|no such model|unsupported/i.test(msg)) {
-    note(`Model row not available to this key: "${cfg.model}". The free-tier list moves — pick one of the rows the picker offers.`, 'err');
+    noteError(`Model row not available to this key: "${shortModel(cfg.model)}". The free-tier list moves — pick one of the rows the picker offers.`, msg);
     // Say "go change the row" and then take them there: the row box is the one field that
     // fixes this, and hunting for it mid-failure is how people give up and reload.
     openSheet('model');
+  } else if (/401|UNAUTHENTICATED|API key not valid/i.test(msg)) {
+    noteError('Google does not accept that key. Check it was pasted whole — no space, no quote, and it has to be a *Gemini API* key, not a Cloud one.', msg);
+    openSheet('key');
   } else {
-    note(msg, 'err');
+    noteError(humanError(msg), msg);
   }
-  el.say.textContent = 'Setup fail hua — ⚙ khol ke dekho.';
-  el.sheetLog.textContent += '\n' + msg;
-  el.sheetLog.hidden = false;
+  // The headline under the orb is the only part a caller reads twice. It stays one clause long,
+  // and it never carries the wire text: no caller has ever debugged a phone call by reading a
+  // field path off the thing they are trying to have a conversation on.
+  el.say.textContent = 'Setup fail hua — \u2699 khol ke dekho.';
 }
 
 // ───────────────────────────────────────────────────────── local tools ──
@@ -1634,6 +1919,20 @@ async function failHandshake(tag) {
   if (diagOnce) return; // error and close both fire for one failure; diagnose once
   diagOnce = true;
   clearTimeout(handshakeTimer);
+  // A close reason that names a field is the server telling you exactly what it disliked, and
+  // it proves the request reached Google — which is more than the network could do. So repair
+  // that one field and go again, rather than probing the model list (true, useless: "the row is
+  // fine") and then throwing away the whole config for the sake of one name.
+  const bad = unknownFieldOf(tag);
+  if (bad && fieldRepairs < MAX_FIELD_REPAIRS && !refused.has(refusalKey(bad))) {
+    fieldRepairs++;
+    setMode('connecting', 'connecting');
+    el.say.textContent = 'Fixing the setup frame…';
+    note(`Setup frame refused by the endpoint — ${repairField(bad, tag)}`, 'sys');
+    teardown();
+    setTimeout(start, 400);
+    return;
+  }
   setMode('connecting', 'connecting');
   el.say.textContent = 'Not connected — checking what your key can see…';
   const info = await refreshModels(true);
@@ -1649,15 +1948,28 @@ async function failHandshake(tag) {
     cfg.model = info.best;
     swapped = true;
   } else if (info) {
-    why += ' The model row is fine, so the problem is the path or the frame: a blocked wss:// (corporate proxy, an extension, or an embedder without the right policy), or a setup config this endpoint refused.';
-    one = 'Retrying with a minimal setup frame — voice and VAD fall back to defaults.';
+    // Two different failures look identical from here and are not: silence (nothing came back,
+    // which is what a blocked socket looks like) and an answer we did not like (which no proxy
+    // can produce — it got through). Saying "or a proxy, or the frame" covers both and fixes
+    // neither, so pick by what actually arrived.
+    why += /no setupComplete|never opened|closed before it opened/i.test(tag)
+      ? ' Nothing came back at all, which is a blocked wss://: a corporate proxy, an extension, or an embedder without the right policy.'
+      : ' The row is fine and the endpoint answered, so it is the setup frame it refused. Nothing about your network is implicated.';
+    one = fieldRepairs >= MAX_FIELD_REPAIRS
+      ? 'Retrying with the minimal setup frame — voice and VAD fall back to defaults, and everything else about this call still works.'
+      : `Repairing one field at a time first (${fieldRepairs}/${MAX_FIELD_REPAIRS} used), so the voice you picked survives.`;
   } else {
     why += ' Nothing to probe from here: no key on this page and no server route.';
     one = 'Paste a key in Settings, then Start again.';
   }
   if (handshakeTries >= 2) {
-    note(why + ' Stopping here rather than retrying forever — the reason above is the thing to fix.', 'err');
+    // The previous attempt already printed this reason, verbatim. Repeating a four-sentence
+    // paragraph in a second colour is not emphasis, it is the transcript turning into a log
+    // dump — which is what the screenshot of this app looked like. One line here, pointing at
+    // the thing above it and at the sheet that holds the raw response.
+    note('Stopped retrying after 2 attempts — the reason is the line just above. The raw response is in ⚙ → the log at the bottom.', 'err');
     handshakeTries = 0;
+    fieldRepairs = 0;
     teardown();
     return;
   }
@@ -1667,7 +1979,7 @@ async function failHandshake(tag) {
   // clears triedMinimal and reading the flag after it would always say "full frame".
   const useMinimal = !swapped;
   triedMinimal = useMinimal;
-  note(`${why}${one ? ' ' + one : ''}`, 'sys');
+  noteError(`${why}${one ? ' ' + one : ''}`, tag, 'sys');
   teardown();
   // Set again *after* teardown, which resets it on purpose so a manual Start gets a
   // fresh full attempt. Without this the retry changes two things at once and a
@@ -2105,25 +2417,52 @@ $('sheetSave').addEventListener('click', () => {
   if (ws) { teardown(); note('Session restarted with the new settings — tap the mic again.', 'sys'); }
 });
 
+/**
+ * The one answer "Test connection" gives, shown where the finger already is, and also
+ * written to the log. It used to *replace* the log with its report — so testing the
+ * connection after a failure deleted the failure, which is the one moment a person wants
+ * both the diagnosis and the evidence.
+ */
+function probeSay(line, detail, kind = 'wait') {
+  // The colour has to follow the *verdict*, not a guess at the wording: a status line that
+  // reads "3 Live rows visible — your row is not there" is bad news in a calm voice, and the
+  // first version of this pattern-matched the sentence and painted every probe red.
+  if (el.probeOut) {
+    el.probeOut.textContent = line;
+    el.probeOut.dataset.kind = kind;
+    el.probeOut.hidden = false;
+  }
+  logLine(`probe: ${line}${detail ? `\n${detail}` : ''}`);
+}
+
 $('sheetTest').addEventListener('click', async () => {
-  el.sheetLog.hidden = false;
-  el.sheetLog.textContent = 'probing…';
+  probeSay('probing…');
   const k = $('fKey').value.trim();
-  if (!k && !cfg.keysafe) return (el.sheetLog.textContent = 'no key');
+  if (!k && !cfg.keysafe) return probeSay('no key to test — paste one above', '', 'bad');
   // Same code path the connect failure uses, so "Test" cannot pass while the real
   // thing is broken — two probes with two answers is how these drift.
   const was = cfg.key;
   cfg.key = k || cfg.key;
   const info = await refreshModels(false);
   cfg.key = was;
-  if (!info) return (el.sheetLog.textContent = 'nothing to ask: no key on this page');
-  if (info.error) return (el.sheetLog.textContent = info.error);
-  el.sheetLog.textContent = [
-    `${info.live.length} Live rows visible to this key`,
-    info.ok ? `current row OK: ${shortModel(cfg.model)}` : `current row MISSING: ${shortModel(cfg.model)}`,
-    ...info.live.slice(0, 8).map((n) => `  · ${shortModel(n)}${n === qualify(cfg.model) ? '  ← in use' : ''}`),
-    info.live.length > 8 ? `  … and ${info.live.length - 8} more in the picker` : '',
-  ].filter(Boolean).join('\n');
+  if (!info) return probeSay('nothing to ask: no key on this page', '', 'bad');
+  if (info.error) return probeSay(info.error, '', 'bad');
+  const rows = info.live.map((n) => `  · ${shortModel(n)}${n === qualify(cfg.model) ? '  ← in use' : ''}`).join('\n');
+  probeSay(
+    `${info.live.length} Live row${info.live.length === 1 ? '' : 's'} visible to this key — `
+      + (info.ok ? 'and your pick is one of them' : 'but your row is not, so pick one from Model'),
+    info.ok ? `current row OK: ${shortModel(cfg.model)}\n${rows}` : `current row MISSING: ${shortModel(cfg.model)}\n${rows}`,
+    info.ok ? 'ok' : 'bad',
+  );
+});
+
+if (el.logCopy) el.logCopy.addEventListener('click', () => { copyLog(); });
+if (el.logClear) el.logClear.addEventListener('click', () => {
+  el.sheetLog.textContent = '';
+  logLines = 0;
+  el.sheetLog.setAttribute('data-lines', '0');
+  if (el.logCount) el.logCount.textContent = '';
+  el.logCopy.textContent = 'Copy for a bug report';
 });
 
 (async () => {

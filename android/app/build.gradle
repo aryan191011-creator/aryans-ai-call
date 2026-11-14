@@ -19,8 +19,8 @@ android {
         // is low enough to cover essentially any device anyone will sideload this onto.
         minSdk 23
         targetSdk 34
-        versionCode 9
-        versionName '1.8'
+        versionCode 10
+        versionName '1.9'
     }
 
     sourceSets {

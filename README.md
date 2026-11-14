@@ -255,9 +255,32 @@ Design decisions that are load-bearing, not decorative:
 - **Half-duplex guard.** On laptop speakers the agent hears its own voice and talks over
   itself, so by default we stop feeding the mic while it speaks. Untick it with headphones
   and real interruption works. `Esc` force-flushes playback from either mode.
-- **Config fields degrade instead of dying.** `speechConfig` / `realtimeInputConfig` /
-  transcription field names have churned across model generations. If setup is rejected for
-  an unknown field, the client retries with the minimal setup every Live model accepts.
+- **The setup frame is nested where the proto says so, and repairs itself if not.**
+  `BidiGenerateContentSetup` has two levels: `model`, `tools`, `systemInstruction`,
+  `realtimeInputConfig`, `*AudioTranscription`, `sessionResumption` sit flat on `setup`, while
+  `responseModalities`, `speechConfig`, `temperature` and friends belong one level down under
+  `setup.generationConfig`. Send a generation knob flat and the endpoint does not warn you — it
+  closes the socket with 1007 and a protobuf field path as the reason, and the call never
+  starts. One function builds every frame for both the call and the voice preview, moves those
+  fields to the right level whatever a caller wrote, and audits the result against the field
+  list Google's own client emits (`_LiveConnectConfig_to_mldev`, google-genai 3.3.0), logging a
+  suspect line into `⚙` instead of trusting a memory of a docs page.
+- **A refused field is repaired, not punished.** Field names have churned across model
+  generations, and the first version of this app answered any unknown field by dropping the
+  whole config — voice, VAD and captions included, announced as "fall back to defaults". Now
+  the refusal is read for the field it names: a generation knob is moved down one level, a
+  field the row truly does not have is retired (at any path depth, and only for the row that
+  refused it), and the minimal frame is what is left when nothing was named. The user keeps
+  their voice. A successful connect refills the ladder, so this is bounded per failure run, not
+  per page load.
+- **One failure, one sentence, one box.** A dead call used to print the API's prose in red
+  monospace — ten lines of `Unknown name "responseModalities" at 'setup': Cannot find field.`,
+  twice, on a 6-inch screen, which is a log file where a phone call should be. Now the headline
+  under the orb is one clause, the transcript gets a sentence about what is being done about it,
+  and the raw response goes under a collapsed *technical detail* and into `⚙ → Technical log`:
+  cumulative (a probe must not delete the evidence that a failure produced), line-counted, and
+  copyable with a button that still works on a WebView served over plain http, where
+  `navigator.clipboard` does not exist.
 - **Echo-back is a hard rule in the prompt.** Phone audio is 8 kHz-grade; models hallucinate
   confident digits. The persona must read every number, date, name and amount back digit by
   digit before trusting it. That rule matters more than the model choice.
@@ -324,7 +347,7 @@ adb install app-release.apk        # or just open the Release page and tap the .
   is unsigned-stripped, unobfuscated and a three-second unzip to read. Type it once on the
   `Key` panel; it lives in that app's `localStorage` and goes only to
   `generativelanguage.googleapis.com`.
-- **Verified where.** In the sandbox: 133 boot checks and 29 static APK checks, and the APK is
+- **Verified where.** In the sandbox: 154 boot checks and 29 static APK checks, and the APK is
   never built here — there is no JDK, Gradle or Android SDK in it and `dl.google.com` is
   unreachable, so an APK produced by this container would be a claim, not an artifact. In CI:
   the build, the signature, `aapt2 dump badging` on the result (package, permissions, and
@@ -353,6 +376,12 @@ snippet — which would have passed whatever the Escape branch did. The harness 
 mutations restores every file on every exit path, including the early ones, because a sweep that
 leaves the tree dirty is indistinguishable from a regression in the code under test; it did that
 to a fix once, and the fix had to be re-derived.
+The setup-frame work added three lessons of the same kind, all of them about checks that could
+not lose: an assertion reading `setup.generationConfig === undefined` was *pinning the bug in
+place* (it graded the minimal frame against the code rather than the proto, and the app obeyed it
+into a 1007), a fallback that echoed an unrecognised error "truncated at the first full stop" was
+a shorter stack trace and not a diagnosis, and `deepEqual` on an array returned out of the `vm`
+context fails on realm prototypes even when every element matches.
 
 ## The phone leg — read before you plan around it
 

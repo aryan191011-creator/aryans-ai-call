@@ -197,15 +197,71 @@ main { display: grid; grid-template-rows: auto 1fr; min-height: 0; }
 .turn.live .who::after { content: " · live"; text-transform: none; letter-spacing: 0; color: var(--warn); }
 .turn.live .tx::after { content: "▌"; margin-left: 1px; color: var(--warn); animation: blink 1s steps(2) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
+/* A diagnosis is prose, so it is set as prose. Mono was the whole reason a failed call read
+   like a crash log on a phone screen; the only monospace thing here is a field path, and that
+   lives inside the collapsed disclosure below. */
 .note {
   align-self: center; max-width: 60ch; text-align: center;
-  font: 450 .7rem/1.45 ui-monospace, monospace; color: var(--ink-3);
+  font-size: .78rem; line-height: 1.45; color: var(--ink-2);
   border: 1px dashed var(--line); border-radius: 10px; padding: 6px 10px; background: var(--surface);
 }
 .note.err { color: var(--danger); border-color: color-mix(in oklab, var(--danger) 40%, var(--line)); }
 .note.err::before { content: "⚠ "; }
 .note.sys::before { content: "· "; }
+
+/* The wire text, one tap away and never in the way. Kept because it is what a bug report
+   needs; folded because nobody has ever fixed a phone call by reading a protobuf path. */
+.note.raw { border: 0; padding: 0; background: none; max-width: 46ch; }
+.note.raw details {
+  font-size: .68rem; color: var(--ink-3); text-align: left;
+  border: 1px solid var(--line); border-radius: 9px; padding: 4px 8px; background: var(--surface);
+}
+.note.raw summary {
+  cursor: pointer; list-style: none; text-transform: uppercase;
+  letter-spacing: .07em; font-size: .62rem; color: var(--ink-3);
+  min-height: 24px; display: flex; align-items: center;
+}
+.note.raw summary::-webkit-details-marker { display: none; }
+.note.raw summary::before { content: "⌨ "; }
+.note.raw details[open] summary::before { content: "⌄ "; }
+.note.raw pre {
+  margin: 6px 0 2px; padding: 7px 8px; border-radius: 7px; background: #000;
+  color: var(--ink-2); font: 450 .64rem/1.4 ui-monospace, monospace;
+  white-space: pre-wrap; word-break: break-word; max-height: 30vh; overflow: auto;
+}
 @keyframes rise { from { opacity: 0; transform: translateY(6px) } }
+
+/* The technical log: folded by default, readable when opened, and copyable on a phone where
+   there is no keyboard to retype a model row name from. */
+.probe {
+  margin: 0; align-self: center; text-align: center; max-width: 52ch;
+  font-size: .72rem; line-height: 1.4; color: var(--ink-2);
+}
+/* The palette has no --ok; --you is its green and, unlike a literal, it flips with
+   prefers-color-scheme along with the rest. */
+.probe[data-kind="ok"] { color: var(--you); }
+.probe[data-kind="bad"] { color: var(--danger); }
+.probe[data-kind="wait"] { color: var(--ink-3); }
+.logbox {
+  align-self: stretch; margin: 2px 0 0; border: 1px solid var(--line);
+  border-radius: 10px; background: var(--surface); overflow: hidden;
+}
+.logbox > summary {
+  cursor: pointer; list-style: none; display: flex; align-items: center; gap: 8px;
+  min-height: 40px; padding: 0 12px; font-size: .72rem; letter-spacing: .02em; color: var(--ink-2);
+}
+.logbox > summary::-webkit-details-marker { display: none; }
+.logbox > summary::before { content: "›"; font-size: 1rem; color: var(--ink-3); }
+.logbox[open] > summary::before { content: "⌄"; }
+.logcount { color: var(--ink-3); font-size: .66rem; }
+.logbar { display: flex; gap: 8px; padding: 0 12px 8px; }
+.logbox pre.log {
+  margin: 0; padding: 10px 12px 12px; background: #000; color: var(--ink-2);
+  border-top: 1px solid var(--line); font: 450 .64rem/1.5 ui-monospace, monospace;
+  white-space: pre-wrap; word-break: break-word; max-height: 34vh; overflow: auto;
+  user-select: all; -webkit-user-select: all;
+}
+button.sm { min-height: 34px; padding: 4px 10px; font-size: .7rem; border-radius: 8px; }
 
 .jump {
   position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%);
