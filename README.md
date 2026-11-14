@@ -59,6 +59,14 @@ Design decisions worth defending:
   users untick it in Settings. That trade-off is explicit in config and tested,
   because a silent policy that changes what the interface can do is the kind of
   thing people should not have to discover.
+- **The agent greets first.** The Live API has no opening-message concept: after
+  `setupComplete` it waits for your audio, so a connected call was silence. We send
+  one `clientContent` turn starting with a `<<connected>>` trigger that the persona
+  documents, so the reply comes back as real speech through the same path as any
+  answer. It is never echoed into the transcript, and it resets per call.
+- **A blank persona cannot be saved.** `{...DEFAULTS, ...saved}` let a stored
+  `prompt: ""` override the default, shipping an empty `systemInstruction` and
+  silently stripping every phone-audio rule. Both load and save repair it.
 - **There is a text field.** "I am on a bus" is a normal reason voice fails, and a
   voice-first UI that offers no keyboard fallback just loses the call.
 - **Suggested openers replace the empty state.** Voice has no buttons, so
