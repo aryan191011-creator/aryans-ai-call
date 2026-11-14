@@ -2076,6 +2076,84 @@ check('every frame builder routes through the nesting normaliser', () => {
   }
 });
 
+/**
+ * Every setup key path, graded against a fixture transcribed from google-genai 3.3.0 — the
+ * converter `_LiveConnectConfig_to_mldev` for what may sit on `setup`, and the classes it
+ * delegates to (RealtimeInputConfig, AutomaticActivityDetection, AudioTranscriptionConfig,
+ * SessionResumptionConfig, ProactivityConfig, SpeechConfig) for their children. Deeper levels
+ * (speechConfig → voiceConfig → prebuiltVoiceConfig → voiceName) were read the same way by hand
+ * and are not walked here, so this is a floor on the check, not its limit: an unknown container
+ * is skipped rather than condemned, because the SDK lags the endpoint.
+ */
+const SETUP_PATHS = {
+  setup: ['model', 'systemInstruction', 'tools', 'safetySettings', 'realtimeInputConfig',
+    'sessionResumption', 'labels', 'historyConfig', 'inputAudioTranscription',
+    'outputAudioTranscription', 'proactivity', 'avatarConfig', 'explicitVadSignal',
+    'contextWindowCompression', 'generationConfig'],
+  'setup.generationConfig': ['responseModalities', 'speechConfig', 'temperature', 'topP', 'topK',
+    'maxOutputTokens', 'mediaResolution', 'seed', 'thinkingConfig', 'enableAffectiveDialog',
+    'translationConfig'],
+  'setup.realtimeInputConfig': ['automaticActivityDetection', 'activityHandling', 'turnCoverage',
+    'interimTranscriptTimestampEnabled'],
+  'setup.realtimeInputConfig.automaticActivityDetection': ['disabled', 'startOfSpeechSensitivity',
+    'endOfSpeechSensitivity', 'prefixPaddingMs', 'silenceDurationMs'],
+  'setup.inputAudioTranscription': ['languageCodes', 'languageAuto', 'languageHints',
+    'customVocabulary', 'adaptationPhrases', 'wordTimestamp', 'diarization', 'mode', 'sourceText'],
+  'setup.outputAudioTranscription': ['languageCodes', 'languageAuto', 'languageHints',
+    'customVocabulary', 'adaptationPhrases', 'wordTimestamp', 'diarization', 'mode', 'sourceText'],
+  'setup.sessionResumption': ['handle', 'transparent'],
+  'setup.proactivity': ['proactiveAudio', 'proactiveVideo'],
+};
+
+check('every setup key path the app can emit is one the SDK emits', () => {
+  const strays = [];
+  const walk = (obj, path, tag) => {
+    const legal = SETUP_PATHS[path];
+    if (!legal) return;                      // unknown container: not condemned, not walked
+    for (const k of Object.keys(obj || {})) {
+      if (!legal.includes(k)) strays.push(`${tag}: ${path}.${k}`);
+      walk(obj[k], `${path}.${k}`, tag);
+    }
+  };
+  for (const [i, sock] of sockets.entries()) {
+    for (const f of sock.frames('setup')) walk(f.setup, 'setup', `socket #${i + 1}`);
+  }
+  // The sent frames only cover the configuration the boot scenario happened to run in, and
+  // `realtimeInputConfig` in particular is pushed-to-talk only — a fixture that never sees a
+  // path cannot police it. So build the whole matrix instead: every combination of the two
+  // settings that add fields, on a 3.x row and a 2.5 row, through the app's own builder.
+  const matrix = JSON.parse(vm.runInContext(`
+    (() => {
+      const was = { vad: cfg.vad, caps: cfg.caps, hybrid: cfg.hybrid, model: cfg.model, voice: cfg.voice };
+      const out = [];
+      for (const vad of ['auto', 'ptt']) {
+        for (const caps of ['full', 'lean']) {
+          for (const model of ['models/gemini-3.1-flash-live-preview', 'models/gemini-2.5-flash-native-audio-preview-08-2025']) {
+            cfg.vad = vad; cfg.caps = caps; cfg.model = model; cfg.voice = 'Kore';
+            out.push({ tag: vad + '/' + caps + '/' + model.slice(7, 16), setup: fullSetup().setup });
+            out.push({ tag: 'minimal/' + model.slice(7, 16), setup: minimalSetup().setup });
+          }
+        }
+      }
+      Object.assign(cfg, was);
+      return JSON.stringify(out);
+    })()
+  `, sandbox));
+  assert.ok(matrix.length >= 16, 'the matrix came back thin: ' + matrix.length);
+  for (const f of matrix) walk(f.setup, 'setup', f.tag);
+  const seen = new Set(matrix.flatMap((f) => Object.keys(f.setup || {})));
+  for (const must of ['realtimeInputConfig', 'inputAudioTranscription', 'sessionResumption', 'proactivity']) {
+    assert.ok(seen.has(must), `the matrix never emitted ${must}, so this check is not covering what it claims to`);
+  }
+  assert.deepEqual(strays, [], 'field names this endpoint has never heard of: ' + strays.join(', '));
+  // The fixture is only worth anything if it is the size the SDK says it is. Someone trimming
+  // it to make a failure go away is the failure this check exists to catch.
+  assert.equal(SETUP_PATHS.setup.length, 15, 'the setup list changed size, not just content');
+  assert.equal(SETUP_PATHS['setup.generationConfig'].length, 11, 'the generationConfig list changed size');
+  assert.ok(SETUP_PATHS['setup.outputAudioTranscription'].includes('wordTimestamp'),
+    'wordTimestamp is the name; enableWordTimestamps reads like it and is not');
+});
+
 check('no setup frame in the whole suite ever puts a generation field flat', () => {
   // The real assertion: walk every frame the page actually sent, not the source text.
   // Regex over source is what failed here last time — it can only find what you think to
