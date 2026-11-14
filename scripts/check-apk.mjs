@@ -422,6 +422,17 @@ check('the failure channel itself is wired up', () => {
   const wf = read(paths.wf);
   assert.match(wf, /if: failure\(\)/, 'the report step must run on ANY failed step');
   assert.match(wf, /commits\/\$\{\{ github\.sha \}\}\/comments/, 'posted via the API, the one host reachable from here');
+  // The token is the whole step: `gh` in a run step has no credentials unless you map one, and
+  // on the first run that was forgotten the report step itself went red on the build that most
+  // needed it, which is a worse failure than not having the step.
+  const report = /- name: Report the failure[\s\S]*?\n {6}\S/.exec(wf);
+  assert.ok(report, 'the report step is gone');
+  assert.match(wf, /GH_TOKEN: \$\{\{ github\.token \}\}/, 'gh has no credentials without this');
+  // And an annotation, because it needs nothing: no token, no auth, no host but api.github.com.
+  assert.match(wf, /echo "::error[^"]*\$\{one\}"/,
+    'a red X with no annotation is a red X I cannot read from here');
+  assert.match(wf, /\|\| echo "commit comment unavailable/,
+    'the comment is the nice-to-have; it must not be the only channel or a failing one');
   const teed = [...wf.matchAll(/tee (-a )?\/tmp\/ci\.log/g)];
   assert.ok(teed.length >= 2, `expected checks + build to tee, saw ${teed.length}`);
   assert.match(wf, /set -o pipefail/, '`| tee` alone reports tee\'s exit status, not gradle\'s');
