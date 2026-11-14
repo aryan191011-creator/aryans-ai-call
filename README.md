@@ -13,6 +13,14 @@ One model hears you, decides when you have stopped talking, and speaks back. The
 STT → LLM → TTS chain to tune, which is the only reason a ₹0 stack feels fast enough for
 a phone call instead of a walkie-talkie.
 
+**That is true of everything audible, not just the call.** The voice preview in Settings is
+the same Live row on the same WebSocket with the same `speechConfig` frame — there is no
+second text-to-speech model anywhere in this app. One Google surface
+(`generativelanguage.googleapis.com`), one protocol (`BidiGenerateContent` over
+WebSocket), and the only REST call left is model discovery. A preview rendered by a
+*different* model is how "the sample sounded nicer than the call" gets written: both halves
+of that report are true, and neither is fixable.
+
 ## Run it
 
 ```bash
@@ -51,6 +59,9 @@ claimed here.
 | Auto-scroll must not yank a reader who scrolled up | `stick()` only follows while pinned within 90 px of the bottom; otherwise a "New reply ↓" pill appears and the scroll position is left alone |
 | 44 px targets, 4.5:1 text, `prefers-reduced-motion` and `prefers-contrast` honoured | Sizes are asserted per base rule; motion/contrast/scale can also be overridden in-app and persist, because the OS setting is not always reachable from a phone browser |
 | Latency averages hide the calls people remember | p50 **and p95** of silence→first-audio, plus false-cutoff count (caller resumes within 500 ms of the agent starting), shown in the footer |
+| A transcript is evidence, so nothing may appear twice | Your own words stream while you say them (`interimInputTranscription`), styled as provisional, and the final transcript **rewrites that bubble** instead of landing next to it; the caret disappears when the turn closes |
+| Do not show a state the caller has not heard yet | `waitingForInput` (the model paused to let you continue) is applied when the playback queue drains, not on arrival — flushing early clips the tail of a sentence — and it is a third label besides "talking" and "listening" |
+| The server knows an interruption happened; you do not | `serverContent.interrupted` flushes the queue and ends the turn authoritatively, ahead of anything the local energy VAD inferred; a cancelled tool call is dropped rather than answered, which is a protocol error |
 
 Design decisions worth defending:
 
@@ -102,9 +113,11 @@ automated change, never a spinner:
 | API unreachable at all | Says the browser and Google cannot talk from here — which is also the reason the call fails |
 | Two tries used up | Stops, with the reason on screen, instead of looping |
 
-Exactly one thing changes per attempt, so a success means something. Live rows are ranked
-with native-audio first, because a row that connects and then has no audio to play is
-misread as an audio bug forever. Settings shows how many Live rows your key can see and
+Exactly one thing changes per attempt, so a success means something. Rows are ranked
+newest-major first, and `native-audio` above a text-only row of the same generation, because
+a row that connects and then has nothing to play is misread as an audio bug forever. The
+probe is not name-only either: `gemini-2.5-flash-native-audio-preview-*` is a Live row that
+never says "live", and missing it produces a confident, wrong sentence about *your key*. Settings shows how many Live rows your key can see and
 flags a current row it cannot find **before** you press Start.
 
 Two things found on the way, both real:
@@ -119,6 +132,44 @@ Two things found on the way, both real:
   hour" bug with no error anywhere. The context is a page-level resource; per-call
   teardown drops only that call's graph.
 
+## What the setup frame asks for, and why some of it is withheld
+
+The Live API's JSON is a *proto*: a field a row does not know is not ignored, it is a
+**rejected setup** — which reaches the browser as a dead 1006, indistinguishable from a bad
+key. So the newer fields are asked for only where they are documented, and
+Settings → *Session features* lets you overrule the judgement (Auto / Full / Lean) when a
+row changes its mind before this file does.
+
+| Field | Sent to | Why |
+| --- | --- | --- |
+| `generationConfig.speechConfig…voiceName` | every row | The one place the Live API reads the voice. Sent flat on `setup` it is an unknown field: the call works, and your choice is dropped in silence. |
+| `inputAudioTranscription.customVocabulary` | 3.x rows | ~30 terms an Indian phone call actually contains (`WhatsApp`, `OTP`, `UPI`, `rupees`, `kirana`). Biasing costs nothing, adds no latency, and only lifts words the recogniser was already close to. |
+| `outputAudioTranscription.enableWordTimestamps` | 3.x rows | Captions that arrive with the audio instead of after the turn. |
+| `sessionResumption` | 3.x rows | Asks for a handle so the line can be re-opened *as the same conversation* (below). |
+| `proactivity.proactiveAudio = false` | 2.5 rows only | Lets a model skip input it deems irrelevant. Refused on 3.8, and wrong for a phone agent either way: a caller cannot tell "ignored" from "dead line". |
+| `realtimeInputConfig.automaticActivityDetection.disabled` | only in push-to-talk | The client then owns turn boundaries with `activityStart` / `activityEnd`. |
+| `audioStreamEnd` (per turn, not setup) | server-VAD rows | Hybrid endpointing, below. |
+
+**Hybrid endpointing.** Server VAD waits ~800 ms of silence before deciding you have
+finished, which is felt as dead air after every sentence. On our own end-of-speech the page
+sends `audioStreamEnd` to finalise the turn immediately — but only after **560 ms** of real
+silence, because the documented failure mode of an eager client VAD is cutting people off
+mid-thought, and a caller repeating themselves costs more than the 200 ms saved. Once per
+utterance, and never in push-to-talk, where `activityEnd` already is that signal and
+sending both is a protocol error.
+
+## The call does not end at 15 minutes
+
+Audio-only Live sessions are capped (≈15 min) and the server sends `goAway` before it
+disconnects. The page arms a 13-minute countdown of its own, and when either timer fires it
+**rotates the line**: the old socket is detached and closed, a new one opens carrying the
+`sessionResumption` handle, and the conversation continues — same transcript, same audio
+graph, no second microphone prompt (a refresh must not call `getUserMedia` again, and a
+test says so). It waits for a quiet moment instead of cutting a sentence; `goAway`'s
+`timeLeft` is read as a Duration (`"90s"`, `{seconds}`, or the older
+`timeRemainingAfterMs` — a missed `goAway` is a dead call mid-word); and a row that offers
+no handle is told plainly, because "the AI forgot my order number" must not be a surprise.
+
 ## The voice, and the microphone
 
 **The voice you pick is the voice you get.** `setup.generationConfig.speechConfig.
@@ -130,11 +181,15 @@ with their character word, and a boot check fails if the picker and the JS table
 drift, since an unrecognised name is either ignored or rejects the frame.
 
 **Audition by ear, don't guess at adjectives.** "Warm", "Firm", "Breezy" mean different
-things to different people, so the sheet renders the selected voice reading a real
-Hinglish line via the TTS row (free tier, no dependency, raw 24 kHz PCM wrapped into a
-WAV in the browser). It deliberately sends *no* style directive in the text, because some
-TTS rows read an instruction aloud instead of acting on it. In keysafe mode the sample
-goes through `POST /tts` so the key still never reaches the browser.
+things to different people, so the sheet opens a throwaway Live session — no microphone,
+no tools, no persona — sends the sample line as one `clientContent` turn, and streams the
+24 kHz answer into the same tone chain the call uses. Audio starts before the turn has
+finished, and the completed sample can be saved as a WAV to compare two voices outside the
+page. It deliberately sends *no* style directive in the text: a Live session reads
+instructions as content, so "say this warmly" comes back as the model saying the words
+"say this warmly". Style belongs in the persona, where it already is. In keysafe mode the
+preview rides `/relay`, so the key still never reaches the browser — one route fewer, and
+nothing new for the server to be trusted with.
 
 **Voice feel** is a small fixed chain on the output — low-shelf body, a 3.2 kHz cut for
 the sibilance that makes synthetic voices hiss, and a compressor so an excited read does
@@ -211,11 +266,14 @@ answers the mobile over HFP.
 
 ## Next
 
-1. **Quota-aware routing.** A second brain for when Google's free lane 429s: Groq's free tier
-   gives `whisper-large-v3-turbo` (20 RPM / 2,000 req/day) and `llama-3.1-8b-instant`
-   (14,400 req/day). Same turn boundary, cascade instead of speech-to-speech.
-2. **Session continuity.** Live API connections cap around 10 minutes; long calls need
-   reconnect + transcript replay. `goAway` is already surfaced in the UI.
+1. **Quota headroom, and no second provider.** One vendor on purpose: one place for audio
+   quality, one protocol, one key, and no "which brain answered that?" inside a transcript
+   the caller is being asked to trust. The cost is real — Google's free lane 429s at a
+   per-project daily wall — so the footer counts Live tokens across the page load, which is
+   the closest thing to a bill a ₹0 stack has. If this ever needs to be more than a personal
+   assistant, the answer is a paid key, not another vendor.
+2. ~~**Session continuity.**~~ Done: the audio-only cap is 15 minutes, and the line rotates
+   itself on a resumption handle. See *The call does not end at 15 minutes*.
 3. **SCO transport.** Replace `getUserMedia` with the oFono SCO socket and this becomes a
    phone call. Keep the VAD, playback queue, tools and metrics untouched — only the pipe moves.
    Two gotchas: the kernel only accepts the phone's audio once you `read()` oFono's

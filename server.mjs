@@ -3,8 +3,9 @@
  *
  * Two jobs, deliberately boring:
  *   1. serve ./web as static files (no bundler, no deps)
- *   2. optionally relay WebSocket audio to Gemini Live so the API key can stay
- *      on the server instead of in the browser (KEYSAFE=1)
+ *   2. optionally relay the Gemini Live WebSocket so the API key can stay on the
+ *      server instead of in the browser (PROXY=1). Everything audible — the call and
+ *      the voice previews — rides that one WebSocket, to one Google endpoint.
  *
  * Direct mode (default): the browser opens the WebSocket to Google itself.
  *   That is Google's officially supported "client-to-server" approach and it is
@@ -20,8 +21,13 @@ import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const GEMINI_ROOT = 'https://generativelanguage.googleapis.com/v1beta';
-const TTS_UPSTREAM =
-  'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent';
+/*
+ * There is deliberately no /tts route. Speaking is done by the Live row itself — the
+ * same WebSocket, the same model row and the same voice frame that the call uses — so a
+ * voice preview cannot sound different from the call it is previewing. A second Google
+ * endpoint here would be a second model with its own prosody, quota and retirement
+ * schedule, plus one more key-bearing path to keep honest.
+ */
 
 const ROOT = fileURLToPath(new URL('./web', import.meta.url));
 const PORT = Number(process.env.PORT || 8787);
@@ -86,9 +92,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === '/models') {
-    // Model discovery for the settings sheet, keysafe mode only — same reasoning as
-    // /tts: the picker cannot be the one thing that only works when the key sits in
-    // browser storage. Read-only passthrough, nothing buffered.
+    // Model discovery for the settings sheet, keysafe mode only: the picker cannot be
+    // the one thing that only works when the key sits in browser storage. Read-only
+    // passthrough, nothing buffered — this is the only REST call the page ever makes.
     if (!PROXY || !GEMINI_API_KEY) {
       res.writeHead(409, { 'content-type': 'application/json' }).end(
         JSON.stringify({ error: { message: 'server is not in keysafe mode — the page should call Google directly' } })
@@ -103,47 +109,6 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(up.status, { 'content-type': up.headers.get('content-type') || 'application/json' });
       res.end(text);
     } catch (e) {
-      res.writeHead(502, { 'content-type': 'application/json' }).end(
-        JSON.stringify({ error: { message: `upstream ${e.message}` } })
-      );
-    }
-    return;
-  }
-
-  if (url.pathname === '/tts') {
-    // Voice audition for the settings sheet. Only exists in keysafe mode, where the
-    // browser has no key of its own: without this the picker would only be able to
-    // preview voices in the weaker, key-in-the-browser mode.
-    if (req.method !== 'POST') {
-      res.writeHead(405, { 'content-type': 'application/json' }).end(JSON.stringify({ error: { message: 'POST only' } }));
-      return;
-    }
-    if (!PROXY || !GEMINI_API_KEY) {
-      res.writeHead(409, { 'content-type': 'application/json' }).end(
-        JSON.stringify({ error: { message: 'server is not in keysafe mode — the page should call Google directly' } })
-      );
-      return;
-    }
-    const chunks = [];
-    let size = 0;
-    for await (const c of req) {
-      size += c.length;
-      if (size > 64 * 1024) { res.writeHead(413).end('too big'); return; }  // a prompt, not a payload
-      chunks.push(c);
-    }
-    try {
-      const up = await fetch(TTS_UPSTREAM, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-        body: Buffer.concat(chunks),
-      });
-      const text = await up.text();
-      res.writeHead(up.status, { 'content-type': up.headers.get('content-type') || 'application/json' });
-      res.end(text);
-    } catch (e) {
-      // Never a bare 500: the sheet shows this string, and "fetch failed" tells the
-      // user nothing while "no egress to generativelanguage.googleapis.com" tells
-      // them the sandbox/host is the problem, not their key.
       res.writeHead(502, { 'content-type': 'application/json' }).end(
         JSON.stringify({ error: { message: `upstream ${e.message}` } })
       );

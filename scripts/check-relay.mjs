@@ -40,26 +40,31 @@ if (!up) {
   process.exit(1);
 }
 
-// The keysafe-only POST route the voice audition uses. Upstream is unreachable from a
-// sandbox, so this is a free fault-injection test: the server must answer with a JSON
-// error a UI can show, and must survive to serve the next request.
+// Speaking is the Live row's job, so there is exactly one REST surface left: model
+// discovery. A /tts route would mean a second Google model between the preview and the
+// call, which is what made a voice ever sound "nicer in Settings than on the phone".
 const tts = await fetch(BASE + '/tts', {
   method: 'POST',
   headers: { 'content-type': 'application/json' },
   body: JSON.stringify({ contents: [{ parts: [{ text: 'hi' }] }] }),
 }).catch((e) => ({ ok: false, status: 0, e: e.message }));
-const ttsBody = await (tts.json?.() || Promise.resolve({})).catch(() => ({}));
-console.log('/tts     ->', tts.status, JSON.stringify(ttsBody).slice(0, 120));
-if (tts.status === 404) throw new Error('server has no /tts route — the audition would 404 in keysafe mode');
-if (tts.ok) console.log('NOTE  /tts returned 200 — this environment has egress, real audio came back');
-else if (!ttsBody?.error?.message) throw new Error('/tts failed without a JSON error body: the sheet would show "undefined"');
+console.log('/tts     ->', tts.status, '(expected 404: no second audio route by design)');
+if (tts.ok) throw new Error('/tts still answers — the client never calls it, so it is a key-bearing route nobody uses');
+if (tts.status !== 404 && tts.status !== 405) throw new Error('/tts answered ' + tts.status + ' instead of 404');
 
 const cfg = await (await fetch(BASE + '/config')).json();
 const health = await (await fetch(BASE + '/healthz')).json();
 console.log('/config  ->', JSON.stringify(cfg));
 console.log('/healthz ->', JSON.stringify(health));
 if (!cfg.keysafe) throw new Error('expected keysafe:true under PROXY=1');
-if (!health.ok) throw new Error('the server died handling /tts — a bad request must not take down a live call');
+if (!health.ok) throw new Error('the server died handling a request for a missing route — a stray fetch must not take down a live call');
+
+// The audition rides /relay in keysafe mode, so the relay has to carry a setup frame
+// with a voice in it, not just the call's. One frame is queued while the upstream leg
+// is still connecting: dropping it is what used to make previews go silent.
+const models = await fetch(BASE + '/models');
+console.log('/models  ->', models.status, '(keysafe passthrough is mounted)');
+if (models.status === 404) throw new Error('/models is gone — the settings sheet cannot check the row against the key');
 
 const ws = new WebSocket(`${WS_BASE}/relay`);
 const got = [];
@@ -86,10 +91,20 @@ const finish = (how) => {
   process.exit(0);
 };
 ws.on('open', () => {
-  // A setup frame must be queued while the upstream leg is still CONNECTING,
-  // not dropped — that is what kills first-turn audio on a cold relay.
-  ws.send(JSON.stringify({ setup: { model: 'models/x', responseModalities: ['AUDIO'] } }));
-  console.log('sent setup frame immediately after open (queue path)');
+  // A setup frame must be queued while the upstream leg is still CONNECTING, not
+  // dropped — that is what kills first-turn audio on a cold relay. This is the shape of
+  // the audition's frame too (voice under generationConfig), so the same queue carries
+  // the voice preview in keysafe mode.
+  ws.send(JSON.stringify({
+    setup: {
+      model: 'models/x',
+      generationConfig: {
+        responseModalities: ['AUDIO'],
+        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Sulafat' } } },
+      },
+    },
+  }));
+  console.log('sent a voice-carrying setup frame immediately after open (queue path)');
 });
 ws.on('message', (m) => got.push(JSON.parse(m.toString())));
 ws.on('close', (c) => finish('close code ' + c));

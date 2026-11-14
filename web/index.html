@@ -76,11 +76,12 @@
   <div class="meters" aria-hidden="true">
     <span class="lvl"><span class="tag">you</span><i><b id="inBar"></b></i></span>
     <span class="lvl"><span class="tag">ai</span><i><b id="outBar"></b></i></span>
-    <span class="counts">
+    <span class="counts" role="group" aria-label="Call quality, live">
       <span title="Silence → first agent audio (what the caller actually feels)">turn <b id="sTurnLat">–</b></span>
       <span title="p50/p95 across this session">spread <b id="sSpread">–</b></span>
       <span title="audio played this session">audio <b id="sRecv">0.0s</b></span>
-      <span title="sessions started; free tier counts requests per day">calls <b id="sCalls">0</b></span>
+      <span title="sessions started; the free tier counts requests per day">calls <b id="sCalls">0</b></span>
+      <span title="Live API tokens across this page load — the closest thing to a bill on a free tier">tok <b id="sTokens">0</b></span>
     </span>
   </div>
 
@@ -146,13 +147,14 @@
 
     <label class="field">
       <span>Model</span>
-      <input id="fModel" list="modelList" value="models/gemini-2.5-flash-native-audio-preview-12-2025" />
+      <input id="fModel" list="modelList" value="models/gemini-3.1-flash-live-preview" />
       <datalist id="modelList">
+        <option value="models/gemini-3.8-live"></option>
+        <option value="models/gemini-3.1-flash-live-preview"></option>
         <option value="models/gemini-2.5-flash-native-audio-preview-12-2025"></option>
         <option value="models/gemini-live-2.5-flash-native-audio"></option>
-        <option value="models/gemini-3.1-flash-live-preview"></option>
       </datalist>
-      <small id="modelHint">Free-tier rows move. This is checked against your key when you save — a row your key cannot see fails as a dead socket, not as an error message.</small>
+      <small id="modelHint">One Google row does everything here — hearing, deciding, and speaking. Free-tier rows move every few weeks; this is checked against your key when you save, and a row your key cannot see fails as a dead socket, not as an error message.</small>
     </label>
 
     <div class="row">
@@ -201,6 +203,26 @@
         </select>
       </label>
     </div>
+
+    <label class="check">
+      <input id="fHybrid" type="checkbox" checked />
+      <span>Finish my turn when I stop — tell the model the sentence is over instead of
+      waiting out its ~800 ms silence timer. Cuts the pause after every line; untick if it
+      ever cuts you off.</span>
+    </label>
+
+    <label class="field">
+      <span>Session features <em>what the setup frame is allowed to ask for</em></span>
+      <select id="fCaps">
+        <option value="auto" selected>Auto — judged by the model row</option>
+        <option value="full">Full — word-timed captions, Hinglish vocabulary, resumable line</option>
+        <option value="lean">Lean — the smallest frame every Live row accepts</option>
+      </select>
+      <small>Full adds the newer fields (transcription biasing, resumption, streaming
+      captions). Some rows reject a field they do not know — and a rejected setup is a
+      dead socket, not an error. Auto asks for them only on rows that document them;
+      pick Lean if a row misbehaves, Full if you are on a new row and want the captions.</small>
+    </label>
 
     <label class="check">
       <input id="fGuard" type="checkbox" checked />
@@ -252,10 +274,14 @@
         <b>Warm</b> on laptop speakers, <b>Clear</b> on a phone.</small>
       </label>
       <label class="field half">
-        <span>Audition line <em>hear a voice before you commit</em></span>
+        <span>Audition line <em>the call model reads this, out loud</em></span>
         <input id="fSample" type="text" autocomplete="off"
                value="Theek hai, main note kar leta hoon. Aur kuch chahiye aapko?" />
         <button class="secondary" id="fAudition" type="button">▶ Hear this voice</button>
+        <button class="secondary" id="fAuditionSave" type="button" hidden>⬇ Save the sample (.wav)</button>
+        <small>A throwaway Live session with the voice you just picked — same row, same
+        voice feel chain, same speakers as the call. It costs one request; nothing else
+        about it touches your key or your history.</small>
       </label>
     </div>
 

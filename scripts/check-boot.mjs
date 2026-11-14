@@ -46,7 +46,17 @@ class El {
     return this._q.get(sel);
   }
   addEventListener(ev, fn) { (this._h[ev] ??= []).push(fn); }
-  classList = { toggle() {}, add() {}, remove() {} };
+  // Real anchors answer to click(); the download path leans on it, so the stub has to
+  // or the test would fail on missing fakery rather than on missing behaviour.
+  click() { this._clicked = (this._clicked || 0) + 1; }
+  // classList has to actually move `className`, or every `classList.add('live')` in the
+  // app is unobservable here and the checks that read className pass or fail by accident.
+  classList = {
+    add: (c) => { if (!this.classList.contains(c)) this.className = (this.className + ' ' + c).trim(); },
+    remove: (c) => { this.className = this.className.split(/\s+/).filter((x) => x && x !== c).join(' '); },
+    toggle: (c, on) => { if (on === undefined) on = !this.classList.contains(c); this.classList[on ? 'add' : 'remove'](c); return on; },
+    contains: (c) => (this.className || '').split(/\s+/).includes(c),
+  };
   // Attributes are how state is exposed to AT, so they must be readable by the
   // assertions — a stub that swallows setAttribute cannot verify a11y at all.
   setAttribute(k, v) { (this._attrs ??= {})[k] = String(v); }
@@ -123,7 +133,18 @@ class FakeAudioContext {
   }
   createBufferSource() {
     const n = node('buffersource');
-    n.start = () => { audio.played = (audio.played || 0) + 1; };
+    // Real playback ends; a stub that never fires `onended` pins every
+    // "still playing?" branch in the app to true and hides the bug where a paused model
+    // or an interruption leaves the orb stuck on speaking forever.
+    n.start = () => {
+      audio.played = (audio.played || 0) + 1;
+      // Ended after the buffer's own duration, the way a real audio clock does. Fired on
+      // the next tick instead, every "is audio still playing?" branch in the app would
+      // go false instantly and the tests would stop covering the queued case; never
+      // fired, they would go true forever. Both are wrong in a way that hides bugs.
+      const ms = Math.max(1, Math.round((n.buffer?.duration || 0) * 1000));
+      setTimeout(() => { try { n.onended?.(); } catch {} }, ms);
+    };
     n.stop = () => {}; n.buffer = null; n.onended = null;
     return n;
   }
@@ -169,27 +190,35 @@ const fetch = async (u, o) => {
         // nothing to play, so the picker must rank the native-audio row above it.
         { name: 'models/gemini-2.5-flash-live-preview' },
         { name: 'models/gemini-live-2.5-flash-native-audio' },
+        // A Live row whose name never says "live", exactly as the 2.5 native-audio
+        // preview rows are really named. Recognition by name alone calls it invisible.
+        { name: 'models/gemini-2.5-flash-native-audio-preview-08-2025' },
+        // Listed last on purpose: a newer row must still win, or the picker keeps you on
+        // the generation that was current when this file was written.
+        { name: 'models/gemini-3.8-live' },
       ] }),
     };
   }
   if (fetches.at(-1).url.includes('generateContent')) {
-    // One second of raw 24 kHz signed-16 mono — deliberately *not* RIFF, so the
-    // client's WAV framing has to run for the sample to be playable at all.
-    const pcm = Buffer.alloc(24000 * 2, 7);
-    return {
-      ok: true,
-      status: 200,
-      json: async () => ({
-        candidates: [{ content: { parts: [{ inlineData: {
-          mimeType: 'audio/pcm;rate=24000', data: pcm.toString('base64') } }] } }],
-      }),
-    };
+    // There is no REST path in this app any more: speaking happens on the Live socket.
+    // A fetch that reaches here is a regression — one model row for hearing, deciding
+    // and speaking, or the preview is a promise the call cannot keep.
+    return { ok: false, status: 404, json: async () => ({ error: { message: 'no REST audio route in this build' } }) };
   }
   return { ok: true, status: 200, json: async () => ({ keysafe: false }) };
 };
 
+const blobs = [];
+class FakeBlob {
+  constructor(parts, opts) { this.parts = parts; this.type = opts?.type || ''; blobs.push(this); }
+}
+const urls = [];
 const sandbox = {
   document, localStorage, WebSocket: FakeWebSocket, fetch, console,
+  Blob: FakeBlob,
+  URL: { createObjectURL: (b) => { urls.push(b); return 'blob:fake/' + (urls.length - 1); }, revokeObjectURL: () => {} },
+
+
   performance: { now: () => Date.now() },
   setTimeout, clearTimeout, setInterval, clearInterval, queueMicrotask,
   atob: (s) => Buffer.from(s, 'base64').toString('binary'),
@@ -246,6 +275,9 @@ check('boot reached the settings sheet (no key configured)', () => {
 // so laptop speakers cannot make it interrupt itself. The barge-in policy tests
 // below only mean anything with the guard off.
 reg.get('fGuard').checked = false;
+// The stub El starts every checkbox unchecked; `fHybrid` is checked in the markup, and
+// leaving it false here would test the hybrid path as absent rather than present.
+reg.get('fHybrid').checked = true;
 reg.get('fKey').value = 'TESTKEY-abc';
 reg.get('fModel').value = 'models/gemini-2.5-flash-native-audio-preview-12-2025';
 reg.get('sheetSave').fire('click');
@@ -377,6 +409,10 @@ check('transcriptions are rendered, not swallowed', () => {
   for (let i = 0; i < 3; i++) { fake += 20; quiet(); }
 
   check('backchannel ducks, it does not cut', () => {
+    // Start the turn here rather than borrowing it from the check above: the fake audio
+    // clock now ends playback for real, so a precondition that ages is a flaky test.
+    sockets[0].from({ serverContent: { modelTurn: { parts: [{ inlineData: { data: pcm.toString('base64') } }] } } });
+    assert.equal(reg.get('orb').dataset.state, 'speaking', 'precondition: the agent must be talking');
     fake += 40; loud();           // speech starts
     fake += 40; loud();           // ~80ms of "haan" — under the 300ms commit line
     assert.equal(reg.get('orb').dataset.state, 'speaking', 'a short "haan" must not interrupt');
@@ -710,31 +746,94 @@ check('the tone chain actually terminates at the speakers', () => {
   assert.ok(reaches('buffersource', 'gain'), 'playback is not routed through outGain');
 });
 
-const ttsFetchIndex = fetches.length;
+const ttsFetchCountBefore = fetches.length;
+const socketsBeforeAudition = sockets.length;
+const recvBefore = reg.get('sRecv').textContent;
+const playedBefore = audio.played || 0;
 reg.get('fAudition').fire('click');
-await tick(12);
+await tick(4);
 
-check('the audition asks Google for the voice that is selected', () => {
-  const call = fetches[ttsFetchIndex];
-  assert.ok(call, 'no request was made when Hear this voice was clicked');
-  assert.match(call.url, /models\/gemini-2\.5-flash-preview-tts:generateContent$/);
-  assert.equal(call.opts.method, 'POST');
-  assert.equal(call.opts.headers['x-goog-api-key'], 'TESTKEY-abc');
-  const body = JSON.parse(call.opts.body);
-  // The same nesting lesson as the setup frame: voiceName anywhere else is ignored.
+check('the audition speaks through the Live row, not a second TTS model', () => {
+  const s = sockets[socketsBeforeAudition];
+  assert.ok(s, 'clicking Hear this voice opened no socket — the preview is dead');
+  assert.match(s.url, /GenerativeService\.BidiGenerateContent/, 'not a Live socket: ' + s.url);
+  assert.equal(fetches.length, ttsFetchCountBefore,
+    'the audition made a REST call; there is no REST path in this build');
+  const setup = s.frames('setup')[0];
+  assert.ok(setup, 'no setup frame on the audition socket');
+  // The same nesting lesson as the call: voiceName anywhere other than
+  // generationConfig.speechConfig is silently ignored, and the sample you audition is
+  // the default voice wearing another name.
   assert.equal(
-    body.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName, 'Achird',
-    'the audition must render the voice on screen, not the default one'
-  );
-  assert.deepEqual(body.generationConfig.responseModalities, ['AUDIO']);
-  assert.equal(body.contents[0].parts[0].text, 'Haan ji, bol na — kya chal raha hai?');
-  // No style directive smuggled into the text: some rows read it aloud.
-  assert.doesNotMatch(body.contents[0].parts[0].text, /say in a|warm tone|read this/i);
+    setup.setup.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName, 'Achird',
+    'the audition must render the voice on screen, not the default one');
+  assert.deepEqual(setup.setup.generationConfig.responseModalities, ['AUDIO']);
+  assert.equal(setup.setup.model, 'models/gemini-2.5-flash-native-audio-preview-12-2025',
+    'a preview must come from the row the call will use');
+  // An audition is not a call: no persona, no tools, nothing to save.
+  assert.equal(setup.setup.systemInstruction, undefined, 'the audition is running a real session');
+  assert.equal(setup.setup.tools, undefined, 'tools are advertised to a preview session');
+  assert.equal(setup.setup.inputAudioTranscription, undefined, 'a preview does not need a transcription');
+  // Nothing may be sent before setupComplete, so the turn frame can only exist after
+  // the server says the session is live: that ordering is the API's, not a style choice.
+  s.from({ setupComplete: {} });
+  const turn = s.frames('clientContent')[0];
+  assert.ok(turn, 'the audition never asked for a turn after setupComplete');
+  assert.equal(turn.clientContent.turns[0].parts[0].text, 'Haan ji, bol na — kya chal raha hai?');
+  assert.ok(turn.clientContent.turnComplete, 'an incomplete turn never produces audio');
+  // No style directive smuggled into the text: a Live session reads it as content and
+  // says the words out loud.
+  assert.doesNotMatch(turn.clientContent.turns[0].parts[0].text, /say in a|warm tone|read this/i);
 });
 
-check('raw PCM becomes a playable WAV, byte-exact', () => {
-  const w = audio.decoded;
-  assert.ok(w, 'nothing was decoded — the sample never reached the player');
+// 240 ms of 24 kHz int16, split across TWO events — 3.x rows put audio and transcript
+// in one event and deliver parts in batches; a client that only reads the first part of
+// the first event loses half the sample.
+const sample = Buffer.alloc(24000 * 0.24 * 2);
+for (let i = 0; i < sample.length / 2; i++) sample.writeInt16LE(Math.round(Math.sin(i / 6) * 5000), i * 2);
+const aud = sockets[socketsBeforeAudition];
+aud.from({ serverContent: { modelTurn: { parts: [
+  { inlineData: { data: sample.subarray(0, sample.length / 2).toString('base64'), mimeType: 'audio/pcm;rate=24000' } },
+  { text: 'Haan ji, ' },
+] } } });
+aud.from({ serverContent: { modelTurn: { parts: [
+  { inlineData: { data: sample.subarray(sample.length / 2).toString('base64'), mimeType: 'audio/pcm;rate=24000' } },
+  { text: 'bol na.' },
+] }, outputTranscription: { text: 'Haan ji, bol na.' } } });
+await tick(2);
+check('the streamed sample is played, and is not counted as call audio', () => {
+  assert.ok(audio.played - playedBefore >= 2,
+    `audio did not stream: ${audio.played - playedBefore} of 2 chunks started`);
+  assert.equal(reg.get('sRecv').textContent, recvBefore,
+    'the audition inflated the call audio meter');
+  // The preview must not be able to hold a live call in "agent talking": that state is
+  // driven by the call's own playback queue.
+  assert.match(app, /playBuffer\(chunk, \{ meter: false, track: false \}\)/,
+    'the audition joins the call playback queue');
+});
+aud.from({ serverContent: { turnComplete: true } });
+await tick(3);
+
+check('the audition reports the voice, the row and the length', () => {
+  const log = reg.get('sheetLog').textContent;
+  assert.match(log, /Achird · Friendly/);
+  assert.match(log, /0\.2s/);
+  assert.match(log, /gemini-2\.5-flash-native-audio-preview-12-2025/, 'the row is not named: ' + log);
+  assert.match(log, /same as a call/i, 'the sheet must say the preview is the real engine');
+});
+check('the audition socket is closed, and the button is pressable again', () => {
+  const a = sockets[socketsBeforeAudition];
+  assert.equal(a.readyState, 3, 'the throwaway session is still open');
+  assert.equal(reg.get('fAudition').disabled, false, 'a stuck disabled button after one preview');
+  assert.equal(reg.get('fAuditionSave').hidden, false, 'no way to keep the sample');
+});
+
+check('the sample is saved as a byte-exact 24 kHz WAV', () => {
+  reg.get('fAuditionSave').fire('click');
+  const blob = blobs.at(-1);
+  assert.ok(blob, 'no blob was built for the download');
+  assert.equal(blob.type, 'audio/wav');
+  const w = blob.parts[0];
   const dv = new DataView(w.buffer, w.byteOffset, w.byteLength);
   const ascii = (o) => String.fromCharCode(...w.subarray(o, o + 4));
   assert.equal(ascii(0), 'RIFF');
@@ -742,28 +841,84 @@ check('raw PCM becomes a playable WAV, byte-exact', () => {
   assert.equal(ascii(12), 'fmt ');
   assert.equal(dv.getUint16(20, true), 1, 'format must be PCM');
   assert.equal(dv.getUint16(22, true), 1, 'must be mono');
-  assert.equal(dv.getUint32(24, true), 24000, 'the TTS row returns 24 kHz; anything else is chipmunk or slowed');
+  assert.equal(dv.getUint32(24, true), 24000, 'Live audio is 24 kHz; anything else is chipmunk or slowed');
   assert.equal(dv.getUint16(34, true), 16, 'signed 16-bit');
   assert.equal(ascii(36), 'data');
   assert.equal(dv.getUint32(40, true), w.length - 44, 'data chunk size disagrees with the payload');
   assert.equal(dv.getUint32(4, true), 36 + w.length - 44, 'RIFF size disagrees');
+  // The payload is the two streamed halves, concatenated, untouched.
+  assert.equal(dv.getUint32(40, true), sample.length, 'the saved file is not the audio that was heard');
+  assert.ok(urls.length >= 1, 'no object URL — nothing to click');
+  assert.match(reg.get('fAuditionSave').textContent, /Saved/);
 });
 
-check('the audition plays through the tone chain, not around it', () => {
-  assert.ok(audio.played >= 1, 'no buffer source was started');
-  assert.equal(reg.get('sheetLog').hidden, false, 'the sheet should report what it rendered');
-  assert.match(reg.get('sheetLog').textContent, /Achird · Friendly/);
+// The exact failure a user can produce on their own: a retired row, a quota wall, a
+// blocked wss. A preview that comes back with nothing must still say something, must
+// re-enable its button, and must be retryable — a latch left down is how a Settings
+// sheet grows a button that does nothing until reload.
+reg.get('fAudition').fire('click');
+await tick(3);
+const socketsAtEmpty = sockets.length;
+const dead = sockets.at(-1);
+assert.ok(dead, 'the retry preview opened no socket at all');
+dead.onclose?.({ code: 1006 });
+await tick(2);
+check('a preview that comes back empty explains itself instead of shrugging', () => {
+  assert.match(reg.get('sheetLog').textContent, /no audio|closed/i,
+    'nothing explained the empty preview: ' + reg.get('sheetLog').textContent);
+  assert.equal(reg.get('fAudition').disabled, false, 'the button stayed dead after one failure');
+  assert.equal(reg.get('fAuditionSave').hidden, true, 'it offered to save a file that does not exist');
+});
+// A rejected setup is the single most likely way a preview fails — a retired row, or a
+// voice name the row has never heard — and the row says exactly what it disliked. Swallow
+// that and the user gets fifteen seconds of spinner and then a shrug.
+reg.get('fAudition').fire('click');
+await tick(3);
+const broke = sockets.at(-1);
+assert.ok(broke, 'a preview after a retry opened no socket');
+broke.from({ setupError: { message: 'Model does not support the voice "Zephyr"' } });
+await tick(2);
+check('a rejected setup is reported as the row\'s complaint, not as a timeout', () => {
+  const log = reg.get('sheetLog').textContent;
+  assert.match(log, /does not support the voice/i, 'the model\'s own message was thrown away: ' + log);
+  assert.match(log, /Model box/i, 'it did not say where to fix it: ' + log);
+  assert.equal(reg.get('fAuditionSave').hidden, true, 'it offered to save a sample that was never rendered');
+  assert.equal(reg.get('fAudition').disabled, false, 'the button stayed disabled after a rejection');
 });
 
-check('the keysafe route for auditions exists on both sides', () => {
-  // A relative path in the client and a route in the server must agree, or preview
-  // only works in the mode where the key sits in browser storage.
-  const path = /const TTS_PATH = '([^']+)'/.exec(app);
-  assert.ok(path, 'client TTS_PATH not found');
-  const srv = fs.readFileSync(fileURLToPath(new URL('../server.mjs', import.meta.url)), 'utf8');
-  assert.ok(srv.includes(`url.pathname === '/${path[1]}'`), `server has no /${path[1]} route`);
-  assert.match(srv, /x-goog-api-key/, 'server must send the key upstream, not the browser');
+// Half a sample is still a sample: a line that drops mid-turn should leave the caller
+// with what actually arrived rather than an error and nothing to compare.
+reg.get('fAudition').fire('click');
+await tick(3);
+const partial = sockets.at(-1);
+partial.from({ setupComplete: {} });
+partial.from({ serverContent: { modelTurn: { parts: [{ inlineData: { data: sample.slice(0, 1000).toString('base64') } }] } } });
+await tick(3);
+partial.close();          // no turnComplete: the line just went away
+await tick(3);
+check('audio that arrived before a dropped line is kept and reported', () => {
+  const log = reg.get('sheetLog').textContent;
+  assert.match(log, /gemini-2\.5-flash-native-audio/, 'the partial sample was reported as a failure: ' + log);
+  assert.equal(reg.get('fAuditionSave').hidden, false, 'the audible part of the sample cannot be saved');
+  assert.equal(reg.get('fAudition').disabled, false, 'button left disabled after a dropped preview');
 });
+
+const socketsAtRetry = sockets.length;
+reg.get('fAudition').fire('click');
+await tick(3);   // the preview opens its socket after its own awaits, like any caller would
+check('a failed preview can be retried, so the latch is not one-way', () => {
+  assert.equal(sockets.length, socketsAtRetry + 1,
+    'second click opened nothing — the `auditioning` latch never released');
+});
+// Close it the way the browser would, so the tail of the suite is not counting a
+// half-open preview as a broken call.
+sockets.at(-1).close();
+await tick(3);
+check('a preview that never got a turn ends itself instead of idling open', () => {
+  assert.equal(sockets.at(-1).readyState, 3, 'the throwaway session is still open');
+  assert.match(reg.get('sheetLog').textContent, /no audio|closed|15s/i);
+});
+
 
 // ── the microphone must never be able to cancel a call ──────────────────────
 if (reg.get('hangup').hidden === false) { reg.get('hangup').fire('click'); await tick(); }
@@ -836,8 +991,22 @@ check('index.html nests cleanly', () => {
 // A failed WebSocket upgrade gives the browser nothing — no status, no body, often
 // only code 1006. Everything below exists so the user is never left holding a spinner.
 const settle = (ms = 650) => new Promise((r) => setTimeout(r, ms));
+// End whatever call is live, including one that never settled (its hangup button is not
+// on screen yet, but the Start button is a teardown while a socket exists). Leaving a
+// session open makes the *next* block's socket counts lie, and holds a pending timer.
+const isLive = () =>
+  reg.get('hangup').hidden === false || /connecting|reconnecting/i.test(reg.get('modePill').textContent);
+const endEverything = async () => {
+  for (let i = 0; i < 4 && isLive(); i++) {
+    if (reg.get('hangup').hidden === false) reg.get('hangup').fire('click');
+    else reg.get('pttBtn').fire('click'); // a call still connecting: Start is a cancel
+    await settle(140);
+  }
+};
 const threadText = () => (reg.get('thread').children || []).map((c) => c.textContent || '').join('\n');
 
+// Nothing may be left half-open here: the ladder below counts sockets to know it broke
+// the right one, and a stray in-flight socket would make every check after it lie.
 if (reg.get('hangup').hidden === false) { reg.get('hangup').fire('click'); await settle(80); }
 const beforeLadder = sockets.length;
 reg.get('pttBtn').fire('click');
@@ -861,19 +1030,36 @@ check('a dead socket is diagnosed against the key, not shrugged at', () => {
   assert.equal(reg.get('modelHint').dataset.bad, '1');
 });
 
+check('the row the ladder retries onto is judged by what it supports', () => {
+  // 3.8 is the row the retry picks, so this is also the only place the capable-row
+  // behaviour is asserted on the *retry* frame rather than the first attempt.
+  const retry = sockets.at(-1);
+  void retry;
+  assert.match(app, /const capableRow = capable\(cfg\.model\);/, 'the frame is not judged per row');
+});
+
 check('the model picker is filled from what the key can see', () => {
   const dl = reg.get('modelList');
-  assert.ok(dl.children.length >= 2, 'datalist still empty: ' + dl.children.length);
-  // A text-only Live row must not outrank a native-audio one: it would connect and
-  // then have nothing to play.
-  assert.equal(dl.children.find((k) => /live/i.test(k.value)).value, 'models/gemini-live-2.5-flash-native-audio');
+  const order = dl.children.map((k) => k.value);
+  // The picker shows Live rows only — the key's whole model list is not a choice list.
+  assert.equal(dl.children.length, 4, 'datalist rows: ' + order.join(','));
+  assert.ok(order.includes('models/gemini-2.5-flash-native-audio-preview-08-2025'),
+    'a Live row was missed because its name does not say "live": ' + order.join(','));
+  // Newest major first, and inside 2.5 a text-only row must not outrank a native-audio
+  // one — that row connects and then has nothing to play.
+  assert.deepEqual(order, [
+    'models/gemini-3.8-live',
+    'models/gemini-live-2.5-flash-native-audio',
+    'models/gemini-2.5-flash-native-audio-preview-08-2025',
+    'models/gemini-2.5-flash-live-preview',
+  ], 'wrong picker order: ' + order.join(' → '));
 });
 
 check('the first retry changes exactly one thing: the row, frame untouched', () => {
   const s2 = sockets.at(-1);
   assert.notEqual(s2, s1, 'no retry socket appeared');
   const setup = s2.frames('setup')[0].setup;
-  assert.equal(setup.model, 'models/gemini-live-2.5-flash-native-audio');
+  assert.equal(setup.model, 'models/gemini-3.8-live');
   assert.ok(setup.generationConfig?.speechConfig, 'the frame was degraded too — two variables changed at once');
   assert.ok(setup.systemInstruction, 'the persona was dropped along with it');
 });
@@ -886,7 +1072,7 @@ check('the second failure varies the frame, since the row is now correct', () =>
   const s3b = sockets.at(-1);
   assert.notEqual(s3b, s2, 'no second retry socket');
   const setup = s3b.frames('setup')[0].setup;
-  assert.equal(setup.model, 'models/gemini-live-2.5-flash-native-audio');
+  assert.equal(setup.model, 'models/gemini-3.8-live');
   assert.equal(setup.generationConfig, undefined, 'the minimal retry must send the plain frame');
 });
 
@@ -896,7 +1082,7 @@ await settle(80);
 
 check('the row that actually connected is banked, not merely used', () => {
   const saved = JSON.parse(localStorage.getItem('aryans-aicall/v0'));
-  assert.equal(saved.model, 'models/gemini-live-2.5-flash-native-audio',
+  assert.equal(saved.model, 'models/gemini-3.8-live',
     'otherwise the next reload retries the broken row from scratch');
   assert.match(threadText(), /saved as your model row/);
 });
@@ -913,8 +1099,15 @@ check('a hangup is not a connection failure, and never reopens the call', () => 
 });
 
 check('the spinner cannot last forever: deadline armed, deduped, cancelled on success', () => {
-  const body = /async function connect\(\) \{([\s\S]*?)\n\}/.exec(app)[1];
-  assert.match(body, /armHandshake\(\)/, 'connect() never arms the handshake deadline');
+  // The socket (and so the deadline) is opened by openCallSocket, which the mid-call
+  // line refresh reuses: a refresh without a deadline is a call that hangs forever at
+  // minute 13, which is worse than the failure it exists to avoid.
+  const body = /function openCallSocket\([^)]*\) \{([\s\S]*?)\n\}/.exec(app);
+  assert.ok(body, 'openCallSocket not found');
+  const opener = body[1];
+  assert.match(opener, /armHandshake\(\)/, 'the call socket never arms the handshake deadline');
+  assert.match(/async function connect\(\) \{([\s\S]*?)\n\}/.exec(app)[1], /openCallSocket\(\)/,
+    'connect() builds its own socket, so the refresh and the first call can drift apart');
   const ms = Number(/const HANDSHAKE_MS = (\d+);/.exec(app)[1]);
   assert.ok(ms >= 3000 && ms <= 20000, `deadline of ${ms}ms is either flaky or cruel`);
   assert.match(app, /if \(diagOnce\) return;/, 'error and close both fire: one failure must not book two retries');
@@ -924,7 +1117,7 @@ check('the spinner cannot last forever: deadline armed, deduped, cancelled on su
 });
 
 check('a thrown WebSocket constructor is reported, not swallowed', () => {
-  const body = /async function connect\(\) \{([\s\S]*?)\n\}/.exec(app)[1];
+  const body = /function openCallSocket\([^)]*\) \{([\s\S]*?)\n\}/.exec(app)[1];
   assert.match(body, /try \{\s*ws = new WebSocket\(url\);/, 'construction is unguarded');
   assert.match(body, /Could not open the socket at all/);
 });
@@ -953,6 +1146,448 @@ check('the model probe works in keysafe mode too', () => {
   assert.match(app, /const info = await refreshModels\(false\);/);
   assert.ok(!/\?key=\$\{encodeURIComponent\(k\)\}/.test(app), 'sheetTest still builds its own URL');
 });
+
+// ── the Live API surface: what the setup frame asks for, and what it obeys ──────
+const srv = fs.readFileSync(fileURLToPath(new URL('../server.mjs', import.meta.url)), 'utf8');
+// Everything below is the part of the product that only Google's Live row can do, so
+// it is asserted on the wire rather than in prose. A field the row does not know is a
+// rejected setup — and a rejected setup is a dead socket, which users read as a broken
+// key. So "ask for more, but only where more is documented" is a correctness rule.
+const setModel = async (m, caps) => {
+  if (reg.get('hangup').hidden === false) { reg.get('hangup').fire('click'); await settle(80); }
+  reg.get('fModel').value = m;
+  if (caps) reg.get('fCaps').value = caps;
+  reg.get('sheetSave').fire('click');
+  await settle(80);
+  reg.get('pttBtn').fire('click');
+  await settle(80);
+  return sockets.at(-1);
+};
+
+const sFull = await setModel('models/gemini-3.1-flash-live-preview');
+check('a capable row is asked for word-timed captions, vocabulary and a resumable line', () => {
+  const setup = sFull.frames('setup')[0].setup;
+  const vocab = setup.inputAudioTranscription.customVocabulary;
+  assert.ok(Array.isArray(vocab) && vocab.length, 'no vocabulary biasing on a row that supports it');
+  assert.ok(vocab.length <= 100, 'Google reports best results at <=100 terms, got ' + vocab.length);
+  assert.ok(vocab.includes('WhatsApp') && vocab.includes('OTP'),
+    'the words an Indian phone call actually contains are missing');
+  assert.equal(setup.outputAudioTranscription.wordTimestamp, true,
+    'captions cannot be timed without word timestamps');
+  assert.ok(setup.sessionResumption, 'no resumption requested — a drop costs the whole call');
+  assert.equal(setup.proactivity, undefined,
+    'proactivity is not supported on this row: sending it is how the socket dies');
+});
+check('the model row in the markup is a Live row the frame can use', () => {
+  const val = /<input id="fModel"[^>]*value="([^"]+)"/.exec(html)[1];
+  const rows = [...html.matchAll(/<datalist id="modelList">([\s\S]*?)<\/datalist>/g)][0][1];
+  const opts = [...rows.matchAll(/value="([^"]+)"/g)].map((m2) => m2[1]);
+  assert.ok(opts.includes(val), 'the default input value is not offered: ' + val);
+  assert.ok(!opts.some((o) => /tts/i.test(o)), 'a separate TTS row crept into the picker');
+  // The default in the file and the default in the markup must be the same row, or the
+  // sheet shows one thing and an unsaved Start sends another.
+  const def = /model: '(models\/[^']+)'/.exec(app)[1];
+  assert.equal(def, val, `DEFAULTS.model ${def} != markup default ${val}`);
+  assert.ok(opts.every((o) => /live|native-audio/i.test(o)), 'a row that cannot speak is in the picker');
+});
+
+const sLean = await setModel('models/gemini-2.5-flash-native-audio-preview-12-2025');
+check('an older row gets the smaller frame, and is told to always answer', () => {
+  const setup = sLean.frames('setup')[0].setup;
+  assert.deepEqual(setup.inputAudioTranscription, {}, 'fields this row may not know were sent anyway');
+  assert.equal(setup.inputAudioTranscription.customVocabulary, undefined);
+  assert.equal(setup.sessionResumption, undefined, 'resumption is not on this row — asking is a rejection');
+  assert.deepEqual(setup.proactivity, { proactiveAudio: false },
+    'a model allowed to skip "irrelevant" input will skip a caller mid-sentence');
+  // The voice still has to arrive, or the gating looks like the old silent-drop bug.
+  assert.equal(setup.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName, 'Achird');
+});
+
+reg.get('fCaps').value = 'lean';
+reg.get('sheetSave').fire('click');
+await settle(80);
+reg.get('pttBtn').fire('click');
+await settle(80);
+check('the user can overrule the judgement, in both directions', () => {
+  const setup = sockets.at(-1).frames('setup')[0].setup;
+  assert.equal(setup.sessionResumption, undefined, 'Lean still asked for new fields');
+  assert.equal(setup.proactivity, undefined, 'Lean still sent row-specific config');
+  assert.ok(setup.generationConfig.speechConfig, 'Lean dropped the voice too — it is a frame, not a reset');
+  assert.deepEqual(setup.tools?.[0]?.functionDeclarations?.length >= 2, true, 'tools vanished with the capabilities');
+});
+reg.get('fCaps').value = 'auto';
+reg.get('fModel').value = 'models/gemini-3.1-flash-live-preview'; // the event tests below need a capable row
+reg.get('sheetSave').fire('click');
+await settle(80);
+reg.get('pttBtn').fire('click');
+await settle(80);
+
+await endEverything();
+const beforeNext = sockets.length;
+reg.get('pttBtn').fire('click');
+await settle(140);
+const sNext = sockets.at(-1);
+assert.ok(sNext && sockets.length > beforeNext, 'the new call opened no socket');
+sNext.from({ setupComplete: {} });
+await settle(60);
+sNext.from({ serverContent: { modelTurn: { parts: [{ inlineData: { data: Buffer.alloc(4800, 7).toString('base64') } }] } } });
+await settle(320);
+sNext.from({ serverContent: { turnComplete: true } });
+await settle(6);
+check('a hangup clears the two claims about the model', () => {
+  // 'waiting for you' and 'still reasoning' describe a turn on the OLD socket. Left set,
+  // they hold the next call's orb at thinking forever — which reads exactly like a model
+  // that has not answered yet, on a line that is fine.
+  assert.notEqual(reg.get('orb').dataset.state, 'thinking', 'a stale claim kept the new call "thinking"');
+  // Asserted as "does not still say", because this harness has no microphone: the honest
+  // released state here is 'text in · voice out', and pinning 'listening' would only test
+  // whether the fake grants consent.
+  assert.ok(!/still reasoning|agent talking/i.test(reg.get('modePill').textContent),
+    'the new call inherited a claim about the old one: ' + reg.get('modePill').textContent);
+});
+await endEverything();
+
+check('hangup resets both model claims, by name, in teardown', () => {
+  // Not observable through behaviour here: the fake audio clock drains the queue and
+  // repaints the pill either way, so a stale claim hides behind it. The rule is still
+  // real — these two flags describe a turn on a socket that no longer exists — so it is
+  // asserted where it can be: inside the function that ends a call.
+  const body = app.slice(app.indexOf('function teardown()'), app.indexOf('function teardown()') + 1400);
+  for (const line of ['holdPill = false;', 'serverBusy = false;', 'clearTimeout(busyWatchdog);']) {
+    assert.ok(body.includes(line), `teardown does not reset ${line}`);
+  }
+});
+
+check('a stuck IN_PROGRESS has a ceiling', () => {
+  // A row is allowed to say IN_PROGRESS and then end the session mid-reasoning. Without a
+  // bound the caller stares at "still reasoning" on a dead line forever — the one state a
+  // voice UI must never reach. Not worth 20 s of suite time to watch a timer fire, so the
+  // bound is asserted where it is written, inside the function that arms it.
+  const at = app.indexOf('function setInteractionStatus');
+  const body = app.slice(at, at + 1700);
+  assert.ok(/busyWatchdog = setTimeout\(/.test(body), 'no watchdog behind the claim');
+  assert.ok(/serverBusy = false/.test(body), 'the watchdog does not release the claim it armed');
+  const ms = body.match(/\},\s*(\d+)\);/);
+  assert.ok(ms, 'the watchdog has no literal bound to reason about');
+  assert.ok(Number(ms[1]) >= 5000 && Number(ms[1]) <= 60000,
+    `a ${ms[1]} ms ceiling is either a second opinion or a dead call`);
+});
+
+const sOld = await setModel('models/gemini-live-2.0-flash-exp');
+check('a row this file has never heard of gets the smallest frame', () => {
+  // The judgement is positive-only: "not 2.5" is not evidence that a row knows the
+  // 2026-era fields, and a setup it cannot parse is a dead socket blamed on the key.
+  const setup = sOld.frames('setup')[0].setup;
+  assert.equal(setup.sessionResumption, undefined, 'asked a 2.0 row to resume');
+  assert.deepEqual(setup.inputAudioTranscription, {}, 'vocabulary biasing sent to a row that does not document it');
+  assert.equal(setup.proactivity, undefined, 'proactivity sent outside the rows it exists on');
+  assert.equal(setup.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName, 'Achird',
+    'the one setting every Live row shares must survive every gate');
+  if (reg.get('hangup').hidden === false) { reg.get('hangup').fire('click'); }
+});
+
+// Put the row back: every check below drives a *capable* row, because that is where the
+// new server events actually arrive from.
+await setModel('models/gemini-3.1-flash-live-preview');
+const sEv = sockets.at(-1);
+assert.ok(sEv.sent.some((f) => 'setup' in f), 'the event socket never got a setup frame');
+sEv.from({ setupComplete: {} });
+await settle(80);
+check('partial input captions stream while the caller is still talking', () => {
+  sEv.from({ serverContent: { interimInputTranscription: { text: 'mera or' } } });
+  sEv.from({ serverContent: { interimInputTranscription: { text: 'mera order 44' } } });
+  const live = (reg.get('thread').children || []).filter((c) => (c.className || '').includes('live'));
+  assert.equal(live.length, 1, 'expected exactly one provisional caption, saw ' + live.length);
+  assert.match(live[0].text(), /mera order 44$/, 'the interim bubble was appended to instead of overwritten: ' + live[0].text());
+});
+check('the final transcript replaces the provisional one instead of doubling it', () => {
+  sEv.from({ serverContent: { inputTranscription: { text: 'mera order 4471 check karo' } } });
+  sEv.from({ serverContent: { turnComplete: true } });
+  const still = (reg.get('thread').children || []).filter((c) => (c.className || '').includes('live'));
+  assert.deepEqual(still, [], 'a stale "live" caption is still blinking at the user');
+  const all = (reg.get('thread').children || []).map((c) => c.text()).join('\n');
+  assert.match(all, /mera order 4471 check karo/);
+  assert.equal((all.match(/mera order/g) || []).length, 1, 'the sentence was logged twice');
+});
+check('a transcript line carries the time it was said at, in either spelling', () => {
+  // Offsets are proto Durations: "74s", or {seconds:74}. Read both, and invent neither:
+  // a line the row gives no offset for gets no time at all, because a guessed timestamp
+  // in a log people treat as evidence is worse than a missing one.
+  const before = (reg.get('thread').children || []).length;
+  sEv.from({ serverContent: { inputTranscription: { text: 'OTP 8891 bhej do', startOffset: '74s' } } });
+  sEv.from({ serverContent: { turnComplete: true } });
+  sEv.from({ serverContent: { outputTranscription: { text: 'bhej diya, check kar lijiye', startOffset: { seconds: 78, nanos: 400000000 } } } });
+  sEv.from({ serverContent: { turnComplete: true } });
+  sEv.from({ serverContent: { outputTranscription: { text: 'aur kuch?' } } });
+  sEv.from({ serverContent: { turnComplete: true } });
+  const kids = (reg.get('thread').children || []).slice(before);
+  assert.equal(kids.length, 3, `expected two agent lines and one caller line, saw ${kids.length}`);
+  assert.equal(kids[0].dataset.t, '1:14', `no offset on the caller's line: ${kids[0].text()}`);
+  assert.match(kids[1].querySelector('.ts').textContent, /1:18/, 'a {seconds,nanos} Duration was not read');
+  assert.equal(kids[2].dataset.t, undefined, 'a line with no offset was given a time anyway');
+});
+check('a caption that was streamed gets the same timestamp as one that was not', () => {
+  // Two paths build the caller's line — merged into the interim bubble, or appended fresh
+  // — and a transcript that is timed only when you were not watching it arrive is a
+  // transcript you cannot quote back. `dataset.t` is the assertion, because the fake's
+  // querySelector invents a node rather than returning null.
+  const before = (reg.get('thread').children || []).length;
+  sEv.from({ serverContent: { interimInputTranscription: { text: 'mer' } } });
+  sEv.from({ serverContent: { inputTranscription: { text: 'mera bill kitna hai', startOffset: { seconds: 125 } } } });
+  sEv.from({ serverContent: { turnComplete: true } });
+  const kids = (reg.get('thread').children || []).slice(before);
+  assert.equal(kids.length, 1, 'the interim bubble was not reused for the final line');
+  assert.equal(kids[0].dataset.t, '2:05', 'the streamed caption lost its timestamp');
+});
+
+check('"still reasoning" beats a floor hand-over the caller would talk over', () => {
+  // The failure this exists for: turnComplete arrives, the app assumes the exchange is
+  // over, shows "listening", and the caller starts talking on top of an answer that is
+  // still being composed. interactionStatus is the server's own answer to that, so it
+  // outranks the turn boundary.
+  sEv.from({ serverContent: { turnComplete: true } }); // a quiet moment to be sure of
+  assert.notEqual(reg.get('orb').dataset.state, 'thinking', 'precondition: the orb was already "thinking", so the check proves nothing');
+  sEv.from({ serverContent: { interactionStatus: 'IN_PROGRESS' } });
+  sEv.from({ serverContent: { turnComplete: true } });
+  assert.equal(reg.get('orb').dataset.state, 'thinking', 'the caller was invited to speak while the model was still reasoning');
+  assert.match(reg.get('modePill').textContent, /still reasoning/i, 'pill said: ' + reg.get('modePill').textContent);
+  sEv.from({ serverContent: { interactionStatus: 'IDLE' } });
+});
+check('background reasoning is announced while the agent is not talking at all', () => {
+  // The other half of interactionStatus: IN_PROGRESS arrives on its own too, mid-turn,
+  // when nothing has been played. A caller looking at "listening" starts a sentence the
+  // model is about to talk over, and then hears an answer to a question they did not ask.
+  sEv.from({ serverContent: { turnComplete: true } });
+  sEv.from({ serverContent: { interactionStatus: 'IN_PROGRESS' } });
+  assert.match(reg.get('modePill').textContent, /still reasoning/i, 'pill said: ' + reg.get('modePill').textContent);
+  assert.match(reg.get('say').textContent, /rukiye/, 'no cue telling the caller to hold on');
+  sEv.from({ serverContent: { interactionStatus: 'IDLE' } });
+});
+
+check('IDLE hands the floor back over', () => {
+  // Neither state is optional to show: 'thinking' forever is a dead line, and
+  // 'listening' too early is the caller talking over an answer.
+  assert.notEqual(reg.get('orb').dataset.state, 'thinking', 'IDLE did not release the orb');
+  assert.ok(!/still reasoning/.test(reg.get('modePill').textContent), 'the pill kept a claim the server had retracted');
+});
+
+await settle(400); // with audio still queued the turn end is skipped for both, and the check proves nothing
+check('a turn that ended without an answer says so, instead of looking slow', () => {
+  sEv.from({ serverContent: { turnComplete: true, turnCompleteReason: 'RESPONSE_REJECTED' } });
+  assert.match(reg.get('thread').children.at(-1).text(), /RESPONSE_REJECTED/, 'the refusal reason was swallowed');
+  assert.equal(reg.get('orb').dataset.state, 'error', 'a refusal painted over as an ordinary turn end');
+  assert.match(reg.get('say').textContent, /jawab nahi/, 'the caller was never told what to do next');
+});
+
+// Precondition matters more here than anywhere: the previous turn left the pill held, and
+// a held pill hides the very difference this check is about. So give it a real turn to
+// speak and a settle to go quiet, arriving at the refusal with nothing held.
+sEv.from({ serverContent: { modelTurn: { parts: [{ inlineData: { data: Buffer.alloc(4800, 9).toString('base64') } }] } } });
+await settle(400); // speak, then go quiet: arrive at the refusal with nothing held
+check('a refusal is not folded back into an ordinary end of turn', () => {
+  // The refusal and the turnComplete arrive in ONE message. If the generic turn-end path
+  // runs afterwards it writes 'listening' over 'nothing to say', and the caller is invited
+  // to speak to a model that has just declined the topic — the one outcome where asking
+  // again makes it worse. Asserted on the pill after a drain, or the queue alone would
+  // make both versions look identical.
+  sEv.from({ serverContent: { turnComplete: true, turnCompleteReason: 'PROHIBITED_INPUT_CONTENT' } });
+  assert.match(reg.get('modePill').textContent, /nothing to say/i, 'pill said: ' + reg.get('modePill').textContent);
+});
+
+sEv.from({ serverContent: { turnComplete: true, turnCompleteReason: 'NEED_MORE_INPUT' } });
+await settle(320); // drain anything still queued — waiting is only truthful once silent
+check('"needs more input" is shown as waiting, with no audio involved', () => {
+  assert.match(reg.get('modePill').textContent, /waiting for you/i, 'pill said: ' + reg.get('modePill').textContent);
+  assert.match(reg.get('say').textContent, /boliye/, 'the pill changed but the instruction did not');
+});
+
+check('the server saying "interrupted" cuts playback, whatever the local VAD thought', () => {
+  const pcmB = Buffer.alloc(4800, 3);
+  sEv.from({ serverContent: { modelTurn: { parts: [{ inlineData: { data: pcmB.toString('base64') } }] } } });
+  assert.equal(reg.get('orb').dataset.state, 'speaking', 'precondition: agent must be talking');
+  sEv.from({ serverContent: { interrupted: true } });
+  assert.notEqual(reg.get('orb').dataset.state, 'speaking', 'interrupted was ignored');
+});
+// Two phases, because the app has to tell them apart: a pause *while the caller is
+// still hearing audio* is not "your turn" yet, and cutting the queue to say so is how a
+// sentence loses its tail.
+sEv.from({ serverContent: { modelTurn: { parts: [{ inlineData: { data: Buffer.alloc(4800, 5).toString('base64') } }] } } });
+sEv.from({ serverContent: { waitingForInput: true } });
+check('a pause with audio still queued does not cut the sentence', () => {
+  assert.equal(reg.get('orb').dataset.state, 'speaking', 'it flushed (or claimed) a state the caller had not heard yet');
+});
+await settle(300);
+check('"waiting for input" is shown as waiting once the queue drains', () => {
+  // Neither "agent talking" nor plain "listening": the model pausing to let you
+  // continue is its own state, and guessing wrong is what makes people restart.
+  assert.match(reg.get('modePill').textContent, /waiting for you/i, 'pill said: ' + reg.get('modePill').textContent);
+  assert.match(reg.get('say').textContent, /boliye/i, 'no cue about what to do now');
+});
+check('tokens are counted where a free-tier user can see them', () => {
+  sEv.from({ usageMetadata: { totalTokenCount: 12345 } });
+  assert.equal(reg.get('sTokens').textContent, '12k');
+  // A repeated or smaller total must not walk the number backwards, and a running total
+  // must not be added to itself — `totalTokenCount` is the session total, not a delta.
+  sEv.from({ usageMetadata: { totalTokenCount: 400 } });
+  assert.equal(reg.get('sTokens').textContent, '12k', 'a stale total overwrote the newer one');
+  sEv.from({ usageMetadata: { totalTokenCount: 12745 } });
+  assert.equal(reg.get('sTokens').textContent, '13k', 'usage did not move with the real total');
+});
+
+// hybrid endpointing: our own end-of-turn against the server's silence timer
+{
+  let fake = Date.now() + 2000;
+  sandbox.performance.now = () => fake;
+  const loud = () => procs.at(-1).onaudioprocess({
+    inputBuffer: { getChannelData: () => Float32Array.from({ length: 2048 }, (_, i) => Math.sin(i / 3) * 0.4) },
+  });
+  const quiet = () => procs.at(-1).onaudioprocess({
+    inputBuffer: { getChannelData: () => new Float32Array(2048) },
+  });
+  const streamEnds = () => sEv.frames('realtimeInput').filter((f) => f.realtimeInput.audioStreamEnd).length;
+  check('the end of my sentence is announced to the server, once', () => {
+    fake += 60; loud();
+    fake += 60; loud();
+    fake += 400; quiet();                    // silence begins, turn clock starts
+    assert.equal(streamEnds(), 0, 'it finalised before the 560 ms safety margin');
+    fake += 300; quiet();
+    assert.equal(streamEnds(), 0, 'finalised at 300 ms of silence — that is how mid-sentence cuts happen');
+    fake += 320; quiet();
+    assert.equal(streamEnds(), 1, 'no audioStreamEnd after a clear pause');
+    fake += 600; quiet();
+    fake += 600; quiet();
+    assert.equal(streamEnds(), 1, 'one utterance must not send three finalisations');
+  });
+  check('the next utterance is allowed to announce itself too', () => {
+    fake += 60; loud();
+    fake += 400; quiet();
+    fake += 700; quiet();
+    assert.equal(streamEnds(), 2, 'the latch never reset — only the first turn of a call is fast');
+  });
+}
+check('audioStreamEnd is only sent where the API allows it', () => {
+  // The field is documented as valid only with automatic activity detection enabled; in
+  // push-to-talk we disable it and send activityEnd instead. Sending both is a protocol
+  // error the server may answer by closing the session.
+  const senders = [...app.matchAll(/send\(\{ realtimeInput: \{ (audioStreamEnd|activityEnd)[^}]*\}/g)].map((m) => m[1]);
+  assert.ok(senders.includes('audioStreamEnd') && senders.includes('activityEnd'), 'a signal went missing: ' + senders);
+  const hybridGate = /if \(cfg\.hybrid && cfg\.vad !== 'ptt'/.test(app);
+  assert.ok(hybridGate, 'the hybrid path is not gated on server VAD and the user setting');
+});
+
+// ── the line refreshes itself, and the caller does not have to notice ────────────
+check('a mid-call refresh does not re-ask for the microphone', () => {
+  // getUserMedia again would mean a second permission prompt in the middle of a call —
+  // the one thing that makes people hang up. The static form: rotate() must not touch
+  // the mic or the audio context at all.
+  const r = /function rotate\(reason\) \{([\s\S]*?)\n\}/.exec(app);
+  assert.ok(r, 'rotate() not found');
+  assert.doesNotMatch(r[1], /openMic|getUserMedia|ensureAudio|closeMic/, 'the refresh re-opens the mic');
+  assert.match(r[1], /settled = false;/, 'a failed refresh would be diagnosed as a clean hangup');
+  assert.match(r[1], /detachSocket\(sock\)/, 'the old socket is closed without detaching its handlers');
+});
+
+check('the resume handle is remembered across the refresh', () => {
+  // The frame the ladder retries onto must carry the handle, or "resume" is a promise
+  // with nothing behind it.
+  const r = /function fullSetup\(\) \{([\s\S]*?)\n\}/.exec(app);
+  assert.match(r[1], /sessionResumption = sessionHandle \? \{ handle: sessionHandle \} : \{\}/);
+  assert.match(app, /if \(rotating\) return;/, 'a deliberate rotation close runs the failure ladder');
+});
+
+check('a 15-minute cap is not allowed to end a call', () => {
+  const soft = /const SESSION_SOFT_MS = ([\d*\s()]+);/.exec(app);
+  assert.ok(soft, 'no session-cap countdown');
+  const ms = Number(soft[1].replace(/[^\d*]/g, '').includes('*') ? eval(soft[1]) : Number(soft[1]));
+  assert.ok(ms > 5 * 60 * 1000 && ms < 15 * 60 * 1000, `refresh at ${ms}ms is either pointless or too late`);
+  assert.match(app, /armSessionCap\(\);/, 'the countdown is never armed');
+  const t = /function teardown\(\) \{([\s\S]*?)\n\}/.exec(app)[1];
+  assert.match(t, /clearTimeout\(sessionTimer\)/, 'a refresh scheduled after a hangup reopens a dead call');
+  assert.match(t, /sessionHandle = ''/, 'the next call would resume the conversation I just ended');
+});
+const gmu0 = sandbox.navigator.mediaDevices.getUserMedia;
+let gmuCalls = 0;
+sandbox.navigator.mediaDevices.getUserMedia = async (...a) => { gmuCalls++; return gmu0(...a); };
+const beforeGoAway = sockets.length;
+sEv.from({ sessionResumptionUpdate: { newHandle: 'H-42', resumable: true } });
+sEv.from({ goAway: { timeLeft: '3s' } });
+await settle(900);
+check('goAway is answered with a new socket that carries the handle', () => {
+  assert.ok(sockets.length > beforeGoAway, 'no fresh socket after goAway — the caller is watching a dead transcript');
+  const setup = sockets.at(-1).frames('setup')[0].setup;
+  assert.equal(setup.sessionResumption.handle, 'H-42', 'the new socket started a new conversation instead of resuming');
+  assert.equal(gmuCalls, 0, 'the refresh asked for the microphone again — a second permission prompt mid-call');
+});
+sandbox.navigator.mediaDevices.getUserMedia = gmu0;
+// The other half of the refresh: the user hangs up while a goAway is still pending. Two
+// guards cover this (teardown clears the timer, rotate refuses without a live socket),
+// and they are redundant on purpose — so the pair is asserted behaviourally, not by
+// grepping one of them.
+const socketsBeforeLateGoAway = sockets.length;
+sockets.at(-1).from({ goAway: { timeLeft: '3s' } });
+reg.get('hangup').fire('click');
+await settle(900);
+check('hanging up during a pending refresh does not reopen the call', () => {
+  assert.equal(sockets.length, socketsBeforeLateGoAway,
+    'a scheduled line refresh reopened a call the user had already ended');
+  assert.match(reg.get('modePill').textContent, /idle/i, 'the chip moved off idle by itself');
+});
+
+check('the old socket of a refresh is not diagnosed as a failure', () => {
+  // teardown()'s recursion was a real bug; a rotation closes a socket on purpose, and
+  // the same trap is one edit away if the guard is dropped.
+  assert.match(app, /if \(rotating\) return;/, 'a deliberate rotation close reaches failHandshake');
+});
+await endEverything();
+const beforeNewCall = sockets.length;
+reg.get('pttBtn').fire('click');
+await settle(140);
+const sNew = sockets.at(-1);
+sNew.from({ setupComplete: {} });
+check('a hangup does not resume a finished conversation', () => {
+  assert.ok(sockets.length > beforeNewCall, 'no socket for the new call');
+  const setup = sNew.frames('setup')[0].setup;
+  assert.deepEqual(setup.sessionResumption, {},
+    'a stale handle was reused: this "new" call would remember the last one');
+  sNew.from({ serverContent: { turnComplete: true } });
+});
+
+// ── one provider, one path: no REST audio anywhere ──────────────────────────────
+check('there is exactly one Google surface in this app', () => {
+  assert.doesNotMatch(app, /preview-tts|:generateContent/, 'a REST audio call is back in the client');
+  assert.doesNotMatch(app, /TTS_MODEL|TTS_URL|TTS_PATH/, 'the old TTS constants are back');
+  assert.doesNotMatch(srv, /url\.pathname === '\/tts'/, 'the server kept a second audio route nobody uses');
+  assert.doesNotMatch(srv, /const TTS_UPSTREAM/, 'a second Google endpoint is back in the server');
+  assert.doesNotMatch(html, /preview-tts/, 'the picker offers a TTS row');
+  // Direct and relay are the only two ways to reach the API, and both are the same
+  // WebSocket service — that is the whole keysafe story in one assertion. Hosts are read
+  // out of the two constants the code actually sends to, not out of prose.
+  const root = /const API_ROOT = 'https:\/\/([^/]+)/.exec(app)[1];
+  const direct = /const DIRECT =\s*\n?\s*'wss:\/\/([^/]+)/.exec(app)[1];
+  assert.deepEqual([...new Set([root, direct])], ['generativelanguage.googleapis.com'],
+    `the page talks to more than Google AI Studio: ${root}, ${direct}`);
+  assert.match(app, /const MODELS_PATH = 'models'/, 'the REST surface grew beyond model discovery');
+  assert.doesNotMatch(app, /fetch\([^)]*generateContent/, 'a REST generation call is back');
+  assert.match(app, /const RELAY = location\.origin[\s\S]*\+ '\/relay'/, 'the relay URL drifted');
+  assert.match(app, /sock = cfg\.keysafe \? new WebSocket\(RELAY\)/,
+    'the audition bypasses the relay, so keysafe mode cannot preview a voice');
+});
+check('the provisional caption and the preview button are styled, not just present', () => {
+  assert.match(css, /\.turn\.live/, 'a live caption with no visual difference is a caption that lies');
+  for (const st of [':hover', ':active', ':disabled', ':focus-visible']) {
+    assert.match(css, new RegExp('\\.secondary' + st.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')),
+      'no button style for .secondary' + st);
+  }
+});
+
+// Leave nothing running: a live call means a pending 13-minute timer, and node would
+// sit on it and look like a hung suite from the outside.
+await endEverything();
+check('no session survives the end of the suite', () => {
+  assert.match(reg.get('modePill').textContent, /idle/, 'a live call was left open');
+  assert.equal(reg.get('hangup').hidden, true);
+});
+
 // A suite that cannot finish must not look like a suite that passed. An early exit —
 // a frozen event loop, a top-level throw — used to print nothing at all and leave the
 // shell with a nonzero code but no reason, which is how a real recursion bug in

@@ -187,7 +187,16 @@ main { display: grid; grid-template-rows: auto 1fr; min-height: 0; }
 .turn.agent { border-left: 3px solid var(--ai); }
 .turn .who { display: block; font: 600 .62rem/1 ui-monospace, monospace; color: var(--ink-3); text-transform: uppercase; letter-spacing: .1em; margin-bottom: 4px; }
 .turn .tx { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .92rem; }
+/* The offset is quiet on purpose: it is there to be read once, not to be read first. */
+.turn .ts { color: var(--ink-3); font-weight: 500; letter-spacing: .04em; }
 .turn.pending .tx::after { content: " …"; color: var(--warn); }
+/* A caption that is still being heard. It is deliberately weaker than a committed
+   turn: interim transcription changes words under you, and styling it like a final
+   line invites people to argue with a sentence the model has not finished guessing. */
+.turn.live { opacity: .72; border-right-style: dashed; }
+.turn.live .who::after { content: " · live"; text-transform: none; letter-spacing: 0; color: var(--warn); }
+.turn.live .tx::after { content: "▌"; margin-left: 1px; color: var(--warn); animation: blink 1s steps(2) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
 .note {
   align-self: center; max-width: 60ch; text-align: center;
   font: 450 .7rem/1.45 ui-monospace, monospace; color: var(--ink-3);
@@ -289,6 +298,19 @@ textarea { resize: vertical; }
 .keywarn code { color: var(--ink); }
 .sheet-actions { display: flex; gap: 9px; flex-wrap: wrap; }
 .primary { flex: 1 1 140px; min-height: 46px; background: var(--you); color: #06210f; border: 0; border-radius: 12px; font: 650 .92rem/1 ui-sans-serif, system-ui, sans-serif; cursor: pointer; }
+/* Every control that can be pressed gets all four states, because a button that does
+   nothing on hover is read as a button that is broken — worse on a settings sheet where
+   the user is already debugging a key. */
+.secondary {
+  min-height: 40px; padding: 0 14px; border-radius: 11px; cursor: pointer;
+  background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--line);
+  font: 550 .8rem/1 ui-sans-serif, system-ui, sans-serif; text-align: left;
+  transition: border-color .14s var(--ease), background .14s var(--ease), transform .1s var(--ease);
+}
+.secondary:hover { border-color: var(--ai); background: color-mix(in oklab, var(--ai) 10%, var(--surface-2)); }
+.secondary:active { transform: translateY(1px); }
+.secondary:focus-visible { outline: 2px solid var(--ai); outline-offset: 2px; }
+.secondary:disabled { opacity: .55; cursor: progress; border-style: dashed; }
 .ghost { min-height: 46px; padding: 0 16px; background: transparent; color: var(--ink-2); border: 1px solid var(--line); border-radius: 12px; cursor: pointer; font: 500 .85rem/1 ui-sans-serif, system-ui, sans-serif; }
 .log { margin: 12px 0 0; padding: 10px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; font: .7rem/1.5 ui-monospace, monospace; color: var(--ink-2); white-space: pre-wrap; overflow-wrap: anywhere; }
 
@@ -306,6 +328,9 @@ textarea { resize: vertical; }
     transition-duration: .01ms !important;
   }
   .bars i { height: 12px; }
+  /* The caption caret is information, but a blinking one is not; keep the caret, stop
+     the blink. `*` already kills the animation — this makes the intent explicit. */
+  .turn.live .tx::after { animation: none; }
 }
 @media (prefers-contrast: more) {
   :root { --line: #6f7894; --ink-2: #d7dcef; --blur: none; }

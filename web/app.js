@@ -91,17 +91,56 @@ const VOICES = {
 
 const DEFAULTS = {
   key: '',
-  model: 'models/gemini-2.5-flash-native-audio-preview-12-2025',
+  // The Live rows are preview rows: they get renamed and retired on a schedule. This is
+  // a starting point, not a fact — Settings probes your key for the rows it can actually
+  // see, and a failed handshake retries against that list rather than blaming you.
+  model: 'models/gemini-3.1-flash-live-preview',
   // A phone assistant wants to sound like a person who has time for you, not like a
   // read-aloud engine: Warm over Firm. Anyone can change it, by ear, in Settings.
   voice: 'Sulafat',
   tone: 'natural',
   sample: 'Theek hai, main note kar leta hoon. Aur kuch chahiye aapko?',
   vad: 'server',
+  // Say "my turn is over" to the server instead of waiting for its silence timer.
   guard: true,
+  hybrid: true,
+  // Capable rows get the richer session: word timestamps, a Hinglish-friendly
+  // vocabulary, transcript cleanup, and a resumable handle so a dropped line or the
+  // 15-minute session cap costs the call nothing. Older rows get the smaller frame
+  // they actually accept — sending fields a row does not know is how a call dies.
+  caps: 'auto',
   prompt: DEFAULT_PROMPT,
   greeting: DEFAULT_GREETING,
 };
+
+/**
+ * The row family decides which setup fields exist. Written as a test, not a table, so
+ * a new row name is judged by what it says rather than by whether this file was
+ * updated the week it shipped.
+ */
+const is25Row = (m) => /2\.5|native-audio/.test(String(m || ''));
+const is3Row = (m) => /3\.[0-9]/.test(String(m || ''));
+/**
+ * 'auto' asks only what the row documents. Positive on 3.x, not "everything that is not
+ * 2.5": an old `gemini-live-2.0-flash-exp` row is a Live row too, and a setup frame it
+ * cannot parse is a dead socket blamed on your key. Full and Lean let you overrule a
+ * guess this file got before the next row shipped.
+ */
+const capable = (m) => (cfg.caps === 'full' ? true : cfg.caps === 'lean' ? false : is3Row(m));
+
+/**
+ * Terms the model hears on a phone call in India. Order numbers, apps, money words:
+ * the ones a generic ASR turns into "code" and "order for fee". Biasing is free,
+ * costs no latency, and is the difference between "WhatsApp par bhej do" surviving
+ * and becoming "what's app par bhej do".
+ */
+const BIAS_WORDS = [
+  'WhatsApp', 'Paytm', 'PhonePe', 'UPI', 'OTP', 'COD', 'INR', 'rupees', 'lakh', 'crore',
+  'Aryan', 'Hinglish', 'Jio', 'Airtel', 'Bolt', 'Rapido', 'Zomato', 'Swiggy', 'Flipkart',
+  'Meesho', 'Amazon', 'kirana', 'bhai', 'ji', 'theek', 'kal', 'subah', 'shaam',
+];
+/** Up to 1,000 are allowed; 100 is where Google reports the best results. */
+const CUSTOM_VOCAB = BIAS_WORDS.slice(0, 100);
 
 const LS = 'aryans-aicall/v0';
 /**
@@ -146,7 +185,7 @@ const el = {
   status: $('a11yStatus'), lat: $('latBar'), latFill: $('latFill'), latHint: $('latHint'),
   thread: $('thread'), empty: $('emptyNote'), jump: $('jumpLatest'),
   inBar: $('inBar'), outBar: $('outBar'), sTurnLat: $('sTurnLat'), sSpread: $('sSpread'),
-  sRecv: $('sRecv'), sCalls: $('sCalls'), pttBtn: $('pttBtn'), pttLabel: $('pttLabel'),
+  sRecv: $('sRecv'), sCalls: $('sCalls'), sTokens: $('sTokens'), pttBtn: $('pttBtn'), pttLabel: $('pttLabel'),
   ptt: $('pushToTalk'), muteBtn: $('muteBtn'), hangup: $('hangup'), sheet: $('sheet'),
   sheetLog: $('sheetLog'), keyWarn: $('keyWarn'), gear: $('gearBtn'),
   textForm: $('textForm'), textInput: $('textInput'),
@@ -218,6 +257,34 @@ function makeTurn(who) {
   return d;
 }
 
+/**
+ * A call log without positions is a quote, not a record. Offsets arrive as a proto
+ * Duration — "74s", or {seconds, nanos} — so both spellings are read. A line the row
+ * gives no offset for simply carries no time; nothing here is invented.
+ */
+const mmss = (d) => {
+  let secs = null;
+  if (typeof d === 'number') secs = d;
+  else if (typeof d === 'string') secs = parseFloat(d);
+  else if (d && d.seconds != null) secs = Number(d.seconds) + (Number(d.nanos || 0) / 1e9);
+  if (!Number.isFinite(secs) || secs < 0) return '';
+  return `${Math.floor(secs / 60)}:${String(Math.floor(secs % 60)).padStart(2, '0')}`;
+};
+
+/** Stamp a bubble with its offset from the start of the call, when the row sends one. */
+function stampTurn(node, offset) {
+  const at = mmss(offset);
+  if (!at || !node) return;
+  node.dataset.t = at;
+  let ts = node.querySelector('.ts');
+  if (!ts) {
+    ts = document.createElement('span');
+    ts.className = 'ts';
+    node.querySelector('.who').append(ts);
+  }
+  ts.textContent = ` · ${at}`;
+}
+
 function appendTurn(who, text) {
   if (!text) return;
   if (who === 'agent') {
@@ -229,6 +296,50 @@ function appendTurn(who, text) {
     ububble.querySelector('.tx').textContent += text;
   }
   stick();
+}
+
+/*
+ * Live captions for the caller's own speech. The interim transcript is overwritten, not
+ * appended, and it is a throwaway node: the final `inputTranscription` owns the real
+ * bubble. Keeping them separate is what stops the half-heard version of a sentence
+ * sticking into the log next to the whole one — two copies of "mera order" is how a
+ * transcript becomes untrustworthy, and this transcript is evidence.
+ */
+let interimNode = null;
+function showInterim(text) {
+  const t = String(text || '').trim();
+  if (!t) return;
+  if (!interimNode) {
+    interimNode = makeTurn('user');
+    interimNode.classList.add('live');
+  }
+  interimNode.querySelector('.tx').textContent = t;
+  stick();
+}
+function dropInterim() {
+  if (!interimNode) return;
+  const n = interimNode;
+  interimNode = null;
+  n.classList.remove('live');
+}
+
+/**
+ * The 15-minute audio-session cap is the number that ends calls mid-sentence. The
+ * server tells us via goAway, but a row that never sends one still ends, so the
+ * countdown is armed locally as well: refresh the line while the call is idle rather
+ * than let Google do it at an arbitrary moment.
+ */
+let sessionTimer = null;
+const SESSION_SOFT_MS = 13 * 60 * 1000;
+function armSessionCap() {
+  clearTimeout(sessionTimer);
+  sessionTimer = setTimeout(() => {
+    // Only rotate when it is safe: mid-playback would cut a sentence, and a call the
+    // user is watching is a call that can wait for a quieter second.
+    if (!ws || !settled) return;
+    if (agentSpeaking || activeSrc.length) { setTimeout(armSessionCap, 8000); return; }
+    rotate('13 minute line — refreshing before the server ends it. Bilkul normal hai.');
+  }, SESSION_SOFT_MS);
 }
 
 // ────────────────────────────────────────────────────────────── audio model ──
@@ -258,9 +369,10 @@ let stream = null;
 let proc = null;
 let sink = null; // silent gain node so mic capture actually runs
 let pending = new Int16Array(0);
+let sentStreamEnd = false; // one audioStreamEnd per utterance, or the server hears a stutter
 let playAt = 0; // audio-clock time the next outbound buffer starts at
 let activeSrc = [];
-let stats = { recv: 0, calls: 0, turnStart: 0, firstByteAt: 0, speech: false, since: 0, floor: 0.004 };
+let stats = { recv: 0, calls: 0, turnStart: 0, firstByteAt: 0, speech: false, since: 0, floor: 0.004, tokens: 0 };
 
 const b64 = (bytes) => {
   let s = '';
@@ -328,6 +440,8 @@ async function openMic() {
         stats.since = now;
       }
       stats.turnStart = 0; // still talking → no turn boundary yet
+      stats.silenceAt = 0;
+      sentStreamEnd = false;
     } else if (stats.speech && Math.max(0, now - stats.since) > 260) {
       stats.speech = false;
       if (!stats.turnStart) {
@@ -336,7 +450,19 @@ async function openMic() {
         // caller assumes the line dropped and starts again — voice has no spinner.
         if (agentSpeaking === false && settled) beginThinking();
       }
+      stats.silenceAt = now;
       onSpeechEnd(now);
+    } else if (!stats.speech && stats.turnStart && !sentStreamEnd) {
+      // Hybrid endpointing: the server's own silence wait is ~800 ms, which the caller
+      // feels as dead air at the end of every sentence. `audioStreamEnd` says "that was
+      // my turn" and generation starts now — but only after 560 ms of real silence,
+      // because Google's own guidance is that a client EOU tighter than ~500 ms cuts
+      // people off mid-thought. Trading latency for interruption is a bad deal: the
+      // caller repeating themselves costs more than the 200 ms saved.
+      if (cfg.hybrid && cfg.vad !== 'ptt' && now - stats.silenceAt > 560) {
+        sentStreamEnd = true;
+        send({ realtimeInput: { audioStreamEnd: true } });
+      }
     }
     // noise floor learns downward only, so a noisy room does not lock us open
     stats.floor = Math.min(heard ? stats.floor : Math.max(stats.floor * 0.985, rms), 0.05);
@@ -415,17 +541,21 @@ function closeMic() {
 /** Queue a 24 kHz mono PCM buffer; scheduled gaplessly against the audio clock. */
 /*
  * "Warm", "Firm", "Breezy" are adjectives; two people hear two different voices in
- * them. One REST call to the TTS row plays the actual voice reading an actual line it
- * would say on this call — the choice gets made by ear. Free tier, no dependency.
- * Deliberately no style directive in the text: some TTS rows read an instruction aloud
- * instead of acting on it, which is worse than sending none.
+ * them. So the picker plays the actual voice reading an actual line it would say on
+ * this call, and the choice gets made by ear.
+ *
+ * It is the *Live* row that speaks, not a separate TTS model — one engine end to end.
+ * A REST TTS row and the Live row are different models with different prosody, so an
+ * audition through them is a promise the call cannot keep: people report "the sample
+ * sounded nicer than the call", and that report is literally correct. Same socket,
+ * same voice frame, same 24 kHz PCM, and the same Voice feel chain on the way to the
+ * speakers, so what you hear in Settings is what the caller hears.
+ *
+ * Deliberately no style directive in the text: a Live session reads instructions as
+ * content, so "say this warmly" comes back as the model saying the words "say this
+ * warmly". Style belongs in the persona, where it already is.
  */
-const TTS_MODEL = 'gemini-2.5-flash-preview-tts';
-const TTS_PATH = 'tts';
-const TTS_URL = `https://generativelanguage.googleapis.com/v1beta/models/${TTS_MODEL}:generateContent`;
-
-/** Canonical 44-byte header: the TTS row returns raw 24 kHz signed-16 mono. */
-function pcmToWav(pcm, rate = 24000) {
+function pcmToWav(pcm, rate = OUT_RATE) {
   const len = pcm.length;
   const out = new Uint8Array(44 + len);
   const dv = new DataView(out.buffer);
@@ -449,62 +579,174 @@ function unbase64(str) {
   return out;
 }
 
-async function audition() {
-  const btn = $('fAudition');
-  const log = el.sheetLog;
-  const name = $('fVoice').value;
-  const line = (($('fSample').value || '').trim() || cfg.sample || DEFAULTS.sample).slice(0, 240);
-  const body = JSON.stringify({
-    contents: [{ role: 'user', parts: [{ text: line }] }],
-    generationConfig: {
-      responseModalities: ['AUDIO'],
-      // Same nesting as the Live setup frame, for the same reason.
-      speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: name } } },
-    },
-  });
-  // Keysafe mode keeps the key out of browser storage, so the audition goes through the
-  // server too — otherwise voices could only be previewed in the weaker mode. A key
-  // typed into the sheet but not yet saved still works: this is a preview, not a call.
-  const typedKey = ($('fKey').value || '').trim();
-  const key = cfg.key || typedKey;
-  const viaServer = cfg.keysafe;
-  if (!viaServer && !key) {
-    if (log) log.textContent = 'Paste a key above first — it is needed to render a sample.';
+let auditionWav = null;   // last rendered sample, offered as a file
+let auditioning = false;
+
+/** The sample is a real audio buffer; a file is what makes it shareable. */
+function downloadAudition() {
+  const btn = $('fAuditionSave');
+  if (!auditionWav) {
+    if (btn) btn.textContent = 'Nothing rendered yet — press Hear this voice first';
     return;
   }
-  const url = viaServer ? `${location.origin}/${TTS_PATH}` : TTS_URL;
-  const headers = { 'content-type': 'application/json' };
-  if (!viaServer) headers['x-goog-api-key'] = key;
-
-  btn.disabled = true;
-  if (log) { log.hidden = false; log.textContent = `rendering "${name}" on ${TTS_MODEL}…`; }
+  const name = $('fVoice') ? $('fVoice').value : 'voice';
   try {
-    await ensureAudio();
-    const r = await fetch(url, { method: 'POST', headers, body });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j?.error?.message || `HTTP ${r.status}`);
-    const part = (j?.candidates?.[0]?.content?.parts || []).find((x) => x?.inlineData?.data);
-    if (!part) throw new Error('no audio in the response — the model or voice name may be off');
-    const raw = unbase64(part.inlineData.data);
-    const wav = isRiff(raw) ? raw : pcmToWav(raw, 24000);
-    if (log) log.textContent = `${name} · ${VOICES[name] || '—'} · ${(wav.length / 1024) | 0} kB — plays through your Voice feel chain`;
-    if (actx?.decodeAudioData) {
-      const buf = await actx.decodeAudioData(wav.buffer.slice(0));
-      const src = actx.createBufferSource();
-      src.buffer = buf;
-      src.connect(el.outGain);
-      src.start();
-    } else if (typeof URL !== 'undefined' && URL.createObjectURL && typeof Blob !== 'undefined') {
-      new window.Audio(URL.createObjectURL(new Blob([wav], { type: 'audio/wav' }))).play().catch(() => {});
-    }
+    const url = URL.createObjectURL(new Blob([auditionWav], { type: 'audio/wav' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `aryans-aicall-${String(name).toLowerCase()}-${OUT_RATE / 1000}k.wav`;
+    a.click();
+    // The object URL would otherwise live for the life of the page.
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    if (btn) btn.textContent = 'Saved ✓ — press again for another copy';
   } catch (e) {
-    // Never throw the user into a dead button: say what failed and why.
-    if (log) log.textContent = `Audition failed: ${e.message}`;
-    note(`Audition failed: ${e.message}`, 'err');
-  } finally {
-    btn.disabled = false;
+    // A browser or embed that refuses a programmatic download: say so, and leave the
+    // button doing something the next time.
+    if (btn) btn.textContent = 'This browser will not save a file from the page — play it instead';
+    note(`Could not save the sample: ${e.message}. Press ▶ Hear this voice to play it.`, 'err');
   }
 }
+
+/**
+ * One throwaway Live session, no microphone: setup, one text turn, stream the audio
+ * back as it arrives, close on the first of turnComplete / timeout / failure.
+ */
+async function audition() {
+  if (auditioning) return;
+  const btn = $('fAudition');
+  const log = el.sheetLog;
+  const name = ($('fVoice') && $('fVoice').value) || cfg.voice;
+  const line = ((($('fSample') && $('fSample').value) || '').trim() || cfg.sample || DEFAULTS.sample)
+    .slice(0, 240);
+  const key = cfg.key || (($('fKey') && $('fKey').value) || '').trim();
+  // Keysafe mode keeps the key out of browser storage, so the audition goes through the
+  // relay too — otherwise voices could only be previewed in the weaker mode. A key typed
+  // into the sheet but not yet saved still works: this is a preview, not a call.
+  if (!cfg.keysafe && !key) {
+    if (log) { log.hidden = false; log.textContent = 'Paste a key above first — it is needed to render a sample.'; }
+    return;
+  }
+  auditioning = true;
+  auditionWav = null;
+  const saveBtn = $('fAuditionSave');
+  if (saveBtn) saveBtn.hidden = true;
+  btn.disabled = true;
+  if (log) { log.hidden = false; log.textContent = `rendering "${name}" on ${shortModel(cfg.model)} (Live)…`; }
+
+  // A separate setup from the call's: no mic, no tools, no persona. Asking for an
+  // opening turn is the only input, so this cannot drift into a real session.
+  const sample = liveSetup({
+    model: cfg.model,
+    generationConfig: {
+      responseModalities: ['AUDIO'],
+      speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: name } } },
+    },
+    outputAudioTranscription: {},
+  });
+  let sock = null;
+  let pcm = new Int16Array(0);
+  let heard = '';
+  let closed = false;
+  const finish = (why) => {
+    if (closed) return;
+    closed = true;
+    clearTimeout(deadline);
+    const s = sock;
+    // Detach before close, exactly as a hangup does: a deliberate close that reaches
+    // the failure path would tell the user their key is broken because they previewed
+    // a voice.
+    if (s) { s.onclose = null; s.onerror = null; s.onmessage = null; try { s.close(); } catch {} }
+    auditioning = false;
+    btn.disabled = false;
+    return why;
+  };
+  const deadline = setTimeout(() => {
+    if (closed) return;
+    finish('timeout');
+    const got = pcm.length ? ` · ${(pcm.length / OUT_RATE).toFixed(1)}s of audio before it stopped` : '';
+    if (log) log.textContent = `No audio from ${name} in 15s${got}. The row may be busy or retired — Test connection will say which.`;
+  }, 15000);
+
+  try {
+    await ensureAudio(); // the tone chain is what we are auditioning, so it must exist
+    sock = await openLiveSocket(key);
+    // The socket is already open by the time we get it back, so the setup frame goes
+    // now — and setup must be the first message on the wire, which is why it is not
+    // left to an onopen that has already fired.
+    sock.send(JSON.stringify(sample));
+    sock.onmessage = (ev) => {
+      let m;
+      try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.setupComplete) {
+        // Text in, spoken audio out: the same turn shape the typed composer uses, so
+        // this path is exercised on every call as well as every audition.
+        sock.send(JSON.stringify({
+          clientContent: { turns: [{ role: 'user', parts: [{ text: line }] }], turnComplete: true },
+        }));
+        return;
+      }
+      const sc = m.serverContent;
+      if (sc?.modelTurn?.parts) {
+        // 3.x rows put audio and transcript in ONE event; looping every part, rather
+        // than taking the first, is what stops the caption going missing.
+        for (const p of sc.modelTurn.parts) {
+          const d = p?.inlineData?.data;
+          if (d) {
+            const raw = unbase64(d);
+            const chunk = new Int16Array(raw.buffer, raw.byteOffset, (raw.byteLength / 2) | 0);
+            const merged = new Int16Array(pcm.length + chunk.length);
+            merged.set(pcm); merged.set(chunk, pcm.length);
+            pcm = merged;
+            // Streamed, so the tail arrives while you are already listening — and kept
+            // off the call's meters and playback queue on purpose.
+            playBuffer(chunk, { meter: false, track: false });
+          } else if (p?.text) heard += p.text;
+        }
+      }
+      if (sc?.outputTranscription?.text) heard = sc.outputTranscription.text;
+      // A rejected setup is the most likely failure of all — a retired row, a voice name
+      // this row does not know — and the row says exactly what it disliked. Reporting it
+      // now beats fifteen seconds of spinner.
+      if (m.setupError || m.error) {
+        const msg = (m.setupError || m.error)?.message || JSON.stringify(m.setupError || m.error);
+        finish('setupError');
+        fail(`${msg} — the same row is used by calls, so fix it in the Model box`);
+        return;
+      }
+      if (sc?.turnComplete) { finish('turnComplete'); report(); }
+    };
+    sock.onclose = () => {
+      if (closed) return;
+      finish('close');
+      // Half a sample is still a sample: playing what arrived beats an error, because the
+      // length of the line was never the point of the button.
+      if (pcm.length) report();
+      else fail('the socket closed before any audio came back');
+    };
+    sock.onerror = () => { if (!closed) { finish('error'); fail('the Live socket could not be opened from this page'); } };
+  } catch (e) {
+    finish('throw');
+    fail(e.message);
+  }
+
+  function report() {
+    if (!pcm.length) { fail('the model replied with no audio for this line'); return; }
+    auditionWav = pcmToWav(new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength), OUT_RATE);
+    const secs = (pcm.length / OUT_RATE).toFixed(1);
+    if (log) {
+      log.textContent = `${name} · ${VOICES[name] || '—'} · ${secs}s · ${(auditionWav.length / 1024) | 0} kB — heard through your Voice feel chain, same as a call`
+        + (heard ? `\nhearing: “${heard}”` : '')
+        + `\nThat was ${shortModel(cfg.model)} speaking. Change the row or the voice and press again.`;
+    }
+    if (saveBtn) saveBtn.hidden = false;
+  }
+  function fail(msg) {
+    // Never throw the user into a dead button: say what failed and why, and what to press.
+    if (log) log.textContent = `Audition failed: ${msg}`;
+    note(`Audition failed: ${msg}`, 'err');
+  }
+}
+
 
 /** Wire outGain -> [tone chain] -> destination. outGain stays the duck point. */
 function buildOutput() {
@@ -549,7 +791,8 @@ async function ensureAudio() {
   return Boolean(actx);
 }
 
-function playPcm(int16) {
+/** Schedule a buffer on the tone chain. `meter` keeps it out of the call's counters. */
+function playBuffer(int16, { meter = true, track = true } = {}) {
   const f = new Float32Array(int16.length);
   for (let i = 0; i < int16.length; i++) f[i] = int16[i] / (int16[i] < 0 ? 0x8000 : 0x7fff);
   const buf = actx.createBuffer(1, f.length, OUT_RATE);
@@ -560,21 +803,35 @@ function playPcm(int16) {
   const t = Math.max(actx.currentTime + 0.012, playAt);
   s.start(t);
   playAt = t + buf.duration;
-  stats.recv += buf.duration;
-  el.sRecv.textContent = stats.recv.toFixed(1) + 's';
+  // An audition is not a turn of a call: counting it would inflate the very numbers
+  // that tell you whether the call feels fast, and joining activeSrc would leave the
+  // call stuck on "agent talking" for as long as a preview is in flight.
+  if (meter) {
+    stats.recv += buf.duration;
+    el.sRecv.textContent = stats.recv.toFixed(1) + 's';
+  }
+  if (!track) return;
   activeSrc.push(s);
   s.onended = () => {
     activeSrc = activeSrc.filter((x) => x !== s);
     if (!activeSrc.length) {
       outBarOff();
       if (agentSpeaking) setAgentSpeaking(false);
+      // The pause the server signalled mid-queue only becomes the truth once the
+      // caller has heard the end of what was already queued.
+      if (waitingForInput) { waitingForInput = false; showWaitingForInput(); }
     }
   };
+}
+
+function playPcm(int16) {
+  playBuffer(int16);
 }
 
 const outBarOff = () => (el.outBar.style.width = '0%');
 
 function flushPlayback() {
+  waitingForInput = false; // a flushed queue must not fire a stale state change later
   activeSrc.forEach((s) => {
     try { s.onended = null; s.stop(); } catch {}
   });
@@ -593,8 +850,64 @@ let settled = false; // setupComplete seen
 let triedMinimal = false;
 let tools = {};
 
+/**
+ * The model stopped generating because it thinks you have more to say. Shown as "waiting
+ * for you" and not as an answer or as plain "listening", because both of those make the
+ * caller either answer nothing or start their sentence twice.
+ */
+/**
+ * The server's own answer to "am I done talking to you?", from `interactionStatus`.
+ * IN_PROGRESS means more output may still follow — background reasoning finishing after
+ * the turn looked complete — and IDLE means the server has completed all processing.
+ * It matters because the two states a caller cannot tell apart ("it is still thinking"
+ * and "it is waiting for me") are the two that decide whether they start talking or
+ * hang up. A row that never sends it leaves this false, which is the old behaviour.
+ */
+let serverBusy = false;
+let busyWatchdog = null;
+function setInteractionStatus(v) {
+  const up = String(v || '').toUpperCase();
+  if (!up) return;
+  clearTimeout(busyWatchdog);
+  serverBusy = up === 'IN_PROGRESS';
+  if (serverBusy) {
+    // Say it, rather than let the pill silently keep claiming "thinking" forever: a
+    // model that thinks for 20 s is a fact about the row, not a dead line.
+    if (!activeSrc.length && !muted) {
+      setMode('still reasoning', 'thinking');
+      el.say.textContent = 'Woh soch raha hai — rukiye, awaaz aayegi.';
+    }
+    busyWatchdog = setTimeout(() => {
+      if (serverBusy) { serverBusy = false; stats.stalled = (stats.stalled || 0) + 1; }
+    }, 20000);
+  } else if (callState === 'thinking') {
+    // IDLE while we are still showing 'thinking' means there is nothing more coming:
+    // hand the floor over instead of leaving the caller talking into a 'thinking' orb.
+    showWaitingForInput();
+  }
+}
+
+let waitingForInput = false;
+/**
+ * That this turn's ending has already been explained, so the generic turn-end handler
+ * must not repaint it. Both cases arrive on the same message as `turnComplete` and then
+ * lose to it: `waitingForInput` / `NEED_MORE_INPUT` get "listening" written over
+ * "waiting for you" a few milliseconds later, and a refusal gets folded back into an
+ * ordinary end of turn. Same words to a casual reader, different instruction to the
+ * caller — and in both cases the state that got clobbered is the one they needed.
+ */
+let holdPill = false;
+function showWaitingForInput() {
+  if (!settled) return;
+  setAgentSpeaking(false);
+  setMode('waiting for you', 'listening');
+  el.say.textContent = 'Woh ruk gaye — aap boliye.';
+  holdPill = true;
+}
+
 function setAgentSpeaking(on) {
   agentSpeaking = on;
+  if (on) holdPill = false; // it answered — it is not waiting any more
   duck(1);
   if (on) {
     if (abubble) abubble.classList.add('pending');
@@ -618,6 +931,7 @@ function setAgentSpeaking(on) {
 let thinkTimer = null;
 let duckUntil = 0;
 function beginThinking() {
+  holdPill = false; // the caller spoke: the floor moved, whatever the pill said
   setMode('thinking', 'thinking');
   if (el.lat) el.lat.hidden = false;
   // Any pause approaching 2 s reads as a dead line. Say so before the caller
@@ -697,20 +1011,31 @@ function sendAudio(int16) {
   });
 }
 
+/**
+ * The setup frame, in one place, for both the call and the audition.
+ *
+ * Two rules the Live API enforces silently, so they are encoded here:
+ *  - generation config lives under `setup.generationConfig`. Sent flat on `setup`,
+ *    `speechConfig` is an unknown field: the call connects, the model speaks, and the
+ *    voice you picked is dropped. The worst failure there is, because it looks applied.
+ *  - anything a row may not know must be gated on the row. An unknown field is a
+ *    rejected setup — a dead 1006, indistinguishable from a bad key — so the newer,
+ *    richer fields (transcription biasing, resumption, always-answer) only go to rows
+ *    that document them.
+ */
+const liveSetup = (setup) => ({ setup });
+
 function fullSetup() {
+  const capableRow = capable(cfg.model);
   const setup = {
       model: cfg.model,
-      // These live under setup.generationConfig, not on setup itself — the Live API
-      // reference is explicit. Sent flat, `speechConfig` is an unknown field: the call
-      // still works, the model speaks, and the voice you picked is silently dropped.
-      // That is the worst possible failure, because it looks like it is applying.
       generationConfig: {
         responseModalities: ['AUDIO'],
         speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: cfg.voice } } },
       },
       systemInstruction: { parts: [{ text: cfg.prompt }] },
-    inputAudioTranscription: {},
-    outputAudioTranscription: {},
+      inputAudioTranscription: {},
+      outputAudioTranscription: {},
     // Advertising the tools is what makes them callable. Declaring the handler
     // alone gives you a model that politely describes what it would have done.
     tools: [
@@ -751,11 +1076,143 @@ function fullSetup() {
   if (cfg.vad === 'ptt') {
     setup.realtimeInputConfig = { automaticActivityDetection: { disabled: true } };
   }
-  return { setup };
+  if (capableRow) {
+    // Hinglish is the hardest thing this call asks of a recogniser: Roman-script Hindi
+    // words mixed into English, plus the app and money vocabulary of an Indian phone
+    // call. Biasing is free, adds no latency, and is not a guess at the sentence —
+    // it only lifts the terms the ASR was already close to.
+    setup.inputAudioTranscription.customVocabulary = CUSTOM_VOCAB;
+    // Captions with positions. The field is `wordTimestamp` in AudioTranscriptionConfig
+    // — `enableWordTimestamps` reads like it and is not — and an unknown name here
+    // rejects the whole setup, which is a dead socket blamed on the key. Worth the risk
+    // because a transcript is the artifact of a call: "2:14 pe bola tha" is checkable,
+    // "woh bola tha" is not.
+    setup.outputAudioTranscription.wordTimestamp = true;
+    setup.inputAudioTranscription.wordTimestamp = true;
+    // Do NOT "improve" this later by adding `mode: 'SMART'` (disfluency removal, tidier
+    // Hinglish): SMART and timestamps are mutually exclusive in the API, and a setup that
+    // asks for both is rejected outright — a dead socket, blamed on the key.
+    // Ask for a resumption handle so a dropped line or the session cap costs the
+    // caller nothing: the next socket reattaches to this conversation instead of
+    // starting one where the caller has to say "maine kaha tha" all over again.
+    setup.sessionResumption = sessionHandle ? { handle: sessionHandle } : {};
+  }
+  if (cfg.caps !== 'lean' && is25Row(cfg.model)) {
+    // Proactivity lets a model decide some input does not deserve a reply. Wrong
+    // default for a phone agent: the caller cannot tell "ignored" from "dead line", and
+    // unlike the newer fields this one is only on the 2.5 rows, where it is supported.
+    setup.proactivity = { proactiveAudio: false };
+  }
+  return liveSetup(setup);
 }
-const minimalSetup = () => ({
-  setup: { model: cfg.model, responseModalities: ['AUDIO'] },
-});
+const minimalSetup = () => liveSetup({ model: cfg.model, responseModalities: ['AUDIO'] });
+
+/**
+ * One throwaway Live socket, no mic: used by the voice audition so the sample is
+ * produced by the same row and the same frame as the call. Resolves once the socket is
+ * open; the caller owns setup and teardown.
+ */
+function openLiveSocket(key) {
+  return new Promise((resolve, reject) => {
+    let sock;
+    try {
+      sock = cfg.keysafe ? new WebSocket(RELAY) : new WebSocket(`${DIRECT}?key=${encodeURIComponent(key || '')}`);
+    } catch (e) { reject(e); return; }
+    const t = setTimeout(() => {
+      detachSocket(sock);
+      reject(new Error('the Live socket never opened within 8s — a blocked wss:// or a busy network looks exactly like this'));
+    }, 8000);
+    sock.onopen = () => { clearTimeout(t); resolve(sock); };
+    // A close before `open` is still reported: on the stubbed/embedded paths Chrome can
+    // fail the upgrade without ever firing `error`.
+    sock.onerror = () => { clearTimeout(t); reject(new Error('the Live socket was refused before it opened')); };
+    sock.onclose = (e) => {
+      clearTimeout(t);
+      reject(new Error(`the Live socket closed before it opened${e?.code ? ` (code ${e.code})` : ''}`));
+    };
+  });
+}
+
+/**
+ * Open the call socket and wire the handlers. Used for the first connect and for the
+ * mid-call rotation that dodges the session cap, so the two cannot drift apart.
+ */
+function openCallSocket(reason) {
+  const url = cfg.keysafe ? RELAY : `${DIRECT}?key=${encodeURIComponent(cfg.key)}`;
+  try {
+    ws = new WebSocket(url);
+  } catch (e) {
+    // A thrown constructor means the URL itself is unusable — a config bug, not a
+    // Google problem, and it used to escape into an unhandled rejection while the chip
+    // stayed on "connecting" forever.
+    setMode('error', 'error');
+    el.say.textContent = 'Connect failed.';
+    note(`Could not open the socket at all: ${e.message}`, 'err');
+    return false;
+  }
+  armHandshake();
+  ws.onopen = () => send(triedMinimal ? minimalSetup() : fullSetup());
+  ws.onmessage = onMessage;
+  ws.onclose = (e) => {
+    if (rotating) return; // we closed this one on purpose, mid-call
+    if (!settled) {
+      failHandshake(`socket closed${e.code ? ` with code ${e.code}` : ''}${e.reason ? `: ${e.reason}` : ''}`);
+      return; // failHandshake owns the teardown
+    }
+    teardown();
+  };
+  ws.onerror = () => {
+    if (!settled) failHandshake('socket error before setup');
+  };
+  if (reason) setMode('reconnecting', 'connecting');
+  return true;
+}
+
+/** A socket whose handlers must not outlive it, and a close that must not look like a failure. */
+function detachSocket(sock) {
+  if (!sock) return;
+  sock.onclose = null;
+  sock.onerror = null;
+  sock.onmessage = null;
+  sock.onopen = null;
+  try { sock.close(); } catch {}
+}
+
+let rotating = false;
+let goAwayTimer = null;
+let sessionHandle = '';
+
+/**
+ * Google ends a Live session on a schedule, not on request: `goAway` says when, and
+ * the audio-only cap is around 15 minutes. A call that dies at 15:00 with no warning is
+ * the single most annoying thing a hosted voice agent does, so the line is refreshed
+ * before the server does it for us — the mic, the audio graph and the transcript all
+ * stay, and the new socket resumes the conversation from the handle.
+ */
+function rotate(reason) {
+  if (rotating || !ws || !settled) return;
+  rotating = true;
+  clearTimeout(goAwayTimer);
+  clearTimeout(handshakeTimer);
+  // `sessionResumption` is not offered on every row. Without a handle the audio carries
+  // on but the model starts blank, and a caller who is not told will repeat themselves
+  // and assume the line broke instead.
+  note((reason || 'session cap approaching — refreshing the line, you do not need to do anything')
+    + (sessionHandle ? '' : ' (this row cannot resume — the agent will not remember the earlier part of the call)'),
+    'sys');
+  const sock = ws;
+  ws = null;
+  detachSocket(sock);
+  // The new socket has to earn its own setupComplete. Left true from the previous one,
+  // a failed refresh would fall straight through to teardown() — a silently dead call
+  // instead of a sentence about why, which is the exact failure this whole ladder
+  // exists to prevent.
+  settled = false;
+  openCallSocket('rotate');
+  // If the fresh socket fails, the ladder takes over from here; the caller is still
+  // on the old audio graph either way, so nothing about the mic is re-requested.
+  setTimeout(() => { rotating = false; }, 2500);
+}
 
 async function connect() {
   if (ws) return;
@@ -764,6 +1221,9 @@ async function connect() {
     note('Gemini API key chahiye pehle — free hai, card nahi.', 'err');
     return;
   }
+  // The context is built first, on the tap, before the mic: build it after the gesture
+  // has expired and iOS/Safari leaves it permanently suspended — silent audio, no
+  // error, nothing in the console. So the ordering here is a correctness property.
   await ensureAudio();
   micBlocked = false;
   try {
@@ -780,32 +1240,10 @@ async function connect() {
 
   setMode('connecting', 'connecting');
   el.say.textContent = 'Connecting…';
-  const url = cfg.keysafe ? `${RELAY}` : `${DIRECT}?key=${encodeURIComponent(cfg.key)}`;
-  try {
-    ws = new WebSocket(url);
-  } catch (e) {
-    // A thrown constructor means the URL itself is unusable — a config bug, not a
-    // Google problem, and it used to escape into an unhandled rejection while the chip
-    // stayed on "connecting" forever.
-    setMode('error', 'error');
-    el.say.textContent = 'Connect failed.';
-    note(`Could not open the socket at all: ${e.message}`, 'err');
-    return;
-  }
-  armHandshake();
-  ws.onopen = () => send(triedMinimal ? minimalSetup() : fullSetup());
-  ws.onmessage = onMessage;
-  ws.onclose = (e) => {
-    if (!settled) {
-      failHandshake(`socket closed${e.code ? ` with code ${e.code}` : ''}${e.reason ? `: ${e.reason}` : ''}`);
-      return; // failHandshake owns the teardown
-    }
-    teardown();
-  };
-  ws.onerror = () => {
-    if (!settled) failHandshake('socket error before setup');
-  };
+  // One owner for the socket and its handshake, shared with the mid-call line refresh.
+  openCallSocket();
 }
+
 
 function onMessage(ev) {
   let m;
@@ -842,6 +1280,8 @@ function onMessage(ev) {
       el.say.textContent = 'Type below — I will answer out loud.';
     }
     blip('open');
+    // The line has a hard end; say nothing about it, and refresh it while idle.
+    armSessionCap();
     if (cfg.vad === 'ptt') el.say.textContent = 'Hold the button and talk.';
     // Ask for the opening turn. The caller should not have to speak first just to
     // find out whether the call is alive.
@@ -890,7 +1330,21 @@ function onMessage(ev) {
   }
   if (sc?.inputTranscription?.text) {
     const heardText = sc.inputTranscription.text.trim();
-    appendTurn('user', heardText);
+    if (interimNode) {
+      // The provisional caption and its final version are the same sentence, so the
+      // node is written rather than followed by a second one. A transcript that shows
+      // "mera order" twice is a transcript nobody trusts, and this one is evidence.
+      const tx = interimNode.querySelector('.tx');
+      tx.textContent = heardText || tx.textContent;
+      const done = interimNode;
+      interimNode = null;
+      done.classList.remove('live');
+      stampTurn(done, sc.inputTranscription.startOffset);
+      ububble = null;
+    } else {
+      appendTurn('user', heardText);
+      stampTurn(ububble, sc.inputTranscription.startOffset);
+    }
     // The other half of the barge-in policy, decided on words rather than energy:
     // an explicit stop cuts at once, a backchannel just ducks the volume.
     if (agentSpeaking && STOP_WORDS.test(heardText)) {
@@ -903,18 +1357,106 @@ function onMessage(ev) {
       duck(1);
     }
   }
-  if (sc?.outputTranscription?.text) appendTurn('agent', sc.outputTranscription.text);
+  if (sc?.outputTranscription?.text) {
+    appendTurn('agent', sc.outputTranscription.text);
+    stampTurn(abubble, sc.outputTranscription.startOffset);
+  }
+  // Partial input transcription arrives while the caller is still talking. It is the
+  // only way to answer "kya suna tumne?" before the turn ends, and on a phone line it
+  // is worth more than the final transcript: a caller who sees their own words appear
+  // stops repeating themselves. Overwritten, never appended, and dropped on the final.
+  if (sc?.interimInputTranscription?.text) showInterim(sc.interimInputTranscription.text);
+  // The server says it interrupted the model: that is the authoritative signal to stop
+  // playing, ahead of anything the local energy VAD inferred.
+  if (sc?.interrupted) {
+    flushPlayback();
+    setAgentSpeaking(false);
+    if (callState === 'speaking') setMode('interrupted by you', 'interrupted');
+  }
+  // A reason attached to the end of a turn is worth more than the end itself:
+  // NEED_MORE_INPUT is "I stopped so you can continue", RESPONSE_REJECTED and
+  // MALFORMED_FUNCTION_CALL are "nothing is coming, and here is why". Without them a
+  // refusal is indistinguishable from a slow answer, which is how people restart a
+  // call that was working.
+  if (sc?.turnCompleteReason && sc.turnCompleteReason !== 'TURN_COMPLETE_REASON_UNSPECIFIED') {
+    if (/NEED_MORE_INPUT/.test(sc.turnCompleteReason)) {
+      if (activeSrc.length) waitingForInput = true; else showWaitingForInput();
+    } else if (/REJECTED|PROHIBITED|MALFORMED/.test(sc.turnCompleteReason)) {
+      dropInterim();
+      setAgentSpeaking(false);
+      setMode('nothing to say', 'error');
+      holdPill = true; // the turn ends in this same message and would repaint it
+      el.say.textContent = 'Is baar jawab nahi — Google ne is line ko rok diya.';
+      note(`the model ended the turn without answering (${sc.turnCompleteReason}) — try rephrasing, or ask it a narrower question`, 'err');
+    }
+  }
+  if (sc?.interactionStatus) setInteractionStatus(sc.interactionStatus);
   if (sc?.turnComplete) {
+    // A turn can "complete" while the server is still reasoning in the background, and
+    // the turn-end is not the truth about that — interactionStatus is. Held here means
+    // the orb keeps saying *thinking* instead of inviting the caller over the top of an
+    // answer that is on its way.
+    if (serverBusy) { setMode('still reasoning', 'thinking'); }
     abubble = null;
-    if (!activeSrc.length) setAgentSpeaking(false);
+    dropInterim();
+    if (!activeSrc.length && !serverBusy && !holdPill) setAgentSpeaking(false);
+    // The turn is over; the endpoint clock restarts, so a long pause while the agent
+    // waits does not read as "the line died" and then fire a stale audioStreamEnd.
+    stats.turnEndAt = performance.now();
+  }
+  // "I'm done speaking" and "you have the floor" are different states, and only the
+  // model knows which one this is. Showing *listening* while it is still expecting the
+  // caller to continue is how people start twice and talk over the reply.
+  if (sc?.waitingForInput) {
+    endThinking();
+    // Do NOT flush here: generation runs ahead of playback, so the caller may still be
+    // mid-sentence as far as their ears are concerned. Flip to "waiting" when the local
+    // queue drains, which is the moment it is actually true.
+    if (activeSrc.length) waitingForInput = true;
+    else showWaitingForInput();
   }
 
   if (m.toolCall) handleToolCall(m.toolCall);
+  // A cancelled tool call must not be answered: the server has already dropped it, and
+  // a toolResponse for an unknown id is a protocol error that kills the socket.
+  if (m.toolCallCancellation?.ids?.length) {
+    const gone = new Set(m.toolCallCancellation.ids);
+    pendingToolIds = (pendingToolIds || []).filter((id) => !gone.has(id));
+    note(`tool call cancelled by the server (${gone.size})`, 'sys');
+  }
+  // The server's own warning that it is about to hang up. `timeLeft` is a Duration
+  // (either "60s" or {seconds}), older rows used timeRemainingAfterMs — read all three,
+  // because a missed goAway is a dead call in the middle of a sentence.
+  if (m.goAway) {
+    const g = m.goAway;
+    const secs = typeof g.timeLeft === 'string'
+      ? parseFloat(g.timeLeft)
+      : g.timeLeft?.seconds != null
+        ? Number(g.timeLeft.seconds) + (g.timeLeft.nanos || 0) / 1e9
+        : typeof g.timeRemainingAfterMs === 'number' ? g.timeRemainingAfterMs / 1000 : 0;
+    const inMs = Math.max(400, (secs - 5) * 1000);
+    note(`the line refreshes in ${Math.max(1, Math.round(secs))}s — nothing you need to do`, 'sys');
+    clearTimeout(goAwayTimer);
+    goAwayTimer = setTimeout(() => rotate('goAway reached — reopening the line with the same session'), inMs);
+  }
+  if (m.sessionResumptionUpdate) {
+    const u = m.sessionResumptionUpdate;
+    const tok = u.newHandle || u.token || u.handle || '';
+    if (tok && u.resumable !== false) {
+      sessionHandle = tok;
+    } else if (u.resumable === false) {
+      sessionHandle = '';
+    }
+  }
+  if (m.usageMetadata?.totalTokenCount != null) {
+    // `totalTokenCount` is the session's running total, not a delta — adding it up
+    // would double-count everything and send a free-tier user hunting a quota wall that
+    // is not there. High-water mark, and never down.
+    stats.tokens = Math.max(stats.tokens || 0, m.usageMetadata.totalTokenCount);
+    if (el.sTokens) el.sTokens.textContent = stats.tokens >= 10000 ? (stats.tokens / 1000).toFixed(0) + 'k' : String(stats.tokens);
+  }
   if (m.setupError || m.error) reportError(m.setupError || m.error);
   if (m.relayError) note(`relay: ${m.relayError.reason || m.relayError.code}`, 'err');
-  if (m.goAway) {
-    note(`goAway at ${new Date(m.goAway.timeRemainingAfterMs / 1000).toISOString().slice(11, 19)} remaining — session ending, reconnect to keep talking.`, 'err');
-  }
 }
 
 function reportError(err) {
@@ -963,8 +1505,10 @@ tools.take_note = async ({ text, confirm }) => {
   return { ok: true, saved: all.length };
 };
 
+let pendingToolIds = [];
 async function handleToolCall(call) {
   const responses = [];
+  pendingToolIds = (pendingToolIds || []).concat((call.functionCalls || []).map((f) => f.id));
   for (const fc of call.functionCalls || []) {
     const fn = tools[fc.name];
     let payload;
@@ -975,7 +1519,11 @@ async function handleToolCall(call) {
     }
     responses.push({ id: fc.id, name: fc.name, response: payload });
   }
-  if (responses.length) send({ toolResponse: { functionResponses: responses } });
+  if (responses.length) {
+    const answered = new Set(responses.map((r) => r.id));
+    pendingToolIds = pendingToolIds.filter((id) => !answered.has(id));
+    send({ toolResponse: { functionResponses: responses } });
+  }
 }
 
 const shortModel = (m) => String(m || '').replace(/^models\//, '');
@@ -995,12 +1543,25 @@ async function listLiveModels() {
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw Object.assign(new Error(j?.error?.message || `HTTP ${r.status}`), { status: r.status });
   const rows = Array.isArray(j.models) ? j.models : [];
-  const live = rows.map((m) => m.name).filter((n) => typeof n === 'string' && /live/i.test(n));
-  // Rank, do not just collect. A Live row without native audio would connect and then
-  // have nothing to play — the worst outcome, since "connected" and "silent" together
-  // look like an audio bug rather than a model-choice bug. Both the picker and the
-  // auto-retry read from this order.
-  const rank = (n) => (/native-audio/i.test(n) ? 2 : 0) + (/2\.5|3\./.test(n) ? 1 : 0);
+  // `/live/` alone is not enough: `gemini-2.5-flash-native-audio-preview-*` is a Live
+  // row whose name never says so, and a probe that does not know it will tell you your
+  // saved row "is not visible to this key" — a wrong diagnosis aimed at your key.
+  const live = rows
+    .map((m) => m.name)
+    .filter((n) => typeof n === 'string' && /live|native-audio/i.test(n));
+  // Rank, do not just collect. Two rules, in order:
+  //   1. newest major wins — a 3.x row speaks natively, handles multi-part events and
+  //      has the better Hindi/English code-mixing, which is the whole point here;
+  //   2. inside a generation, a `native-audio` row beats one without it, because a Live
+  //      row that cannot speak connects and then plays nothing — and "connected but
+  //      silent" reads as an audio bug, never as a model-choice bug.
+  // Both the picker and the retry ladder read from this one order.
+  const rank = (n) => {
+    const three = /3\.(\d+)/.exec(n);
+    if (three) return 10 + Number(three[1]);
+    if (/2\.5/.test(n)) return /native-audio/i.test(n) ? 5 : 1;
+    return 0;
+  };
   return live.sort((a, b) => rank(b) - rank(a));
 }
 
@@ -1114,6 +1675,19 @@ async function failHandshake(tag) {
 
 function teardown() {
   clearTimeout(handshakeTimer);
+  dropInterim(); // a caption left blinking "live" after a hangup is claiming a state that ended
+  clearTimeout(sessionTimer);
+  clearTimeout(goAwayTimer);
+  rotating = false;
+  // Both are turn-scoped claims about the model, not facts about the line: kept across a
+  // hangup, the next call starts out refusing to repaint its own state.
+  holdPill = false;
+  serverBusy = false;
+  clearTimeout(busyWatchdog);
+  // A hangup ends the conversation; the next Start must not try to resume it. That
+  // would be a genuinely wrong thing to do to a person who called back about something
+  // else, and the API would accept it silently.
+  sessionHandle = '';
   kickedOff = false;
   micBlocked = false; // a new call earns a new greeting
   flushPlayback();
@@ -1298,6 +1872,8 @@ const openSheet = () => {
   $('fModel').value = cfg.model;
   $('fVoice').value = cfg.voice;
   $('fVad').value = cfg.vad;
+  $('fHybrid').checked = cfg.hybrid !== false;
+  $('fCaps').value = cfg.caps || 'auto';
   $('fGuard').checked = cfg.guard;
   $('fTone').value = cfg.tone;
   $('fSample').value = cfg.sample;
@@ -1331,6 +1907,7 @@ $('fVoice').addEventListener('change', () => {
   $('voiceHint').textContent = `${n} · ${VOICES[n] || 'unknown to this build'}`;
 });
 $('fAudition').addEventListener('click', () => audition());
+$('fAuditionSave').addEventListener('click', () => downloadAudition());
 // The defaults improve; a copy saved last month does not. One click back, without
 // touching storage — saving stays an explicit act.
 $('fReset').addEventListener('click', () => {
@@ -1349,6 +1926,8 @@ $('sheetSave').addEventListener('click', () => {
     tone: $('fTone').value,
     sample: $('fSample').value.trim() || DEFAULTS.sample,
     vad: $('fVad').value,
+    hybrid: $('fHybrid').checked,
+    caps: $('fCaps').value,
     guard: $('fGuard').checked,
     // Blank resets rather than persists: an empty persona silently removes every
     // rule that makes this behave like a phone agent.
