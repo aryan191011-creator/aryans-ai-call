@@ -1480,7 +1480,10 @@ function reportError(err) {
   if (/RESOURCE_EXHAUSTED|429|quota/i.test(msg)) {
     note('Free-tier quota hit for today. That is the ₹0 ceiling — wait for the day to roll, or use a second project.', 'err');
   } else if (/NOT_FOUND|404|no such model|unsupported/i.test(msg)) {
-    note(`Model row not available to this key: "${cfg.model}". Try another in ⚙ (the free-tier list moves).`, 'err');
+    note(`Model row not available to this key: "${cfg.model}". The free-tier list moves — pick one of the rows the picker offers.`, 'err');
+    // Say "go change the row" and then take them there: the row box is the one field that
+    // fixes this, and hunting for it mid-failure is how people give up and reload.
+    openSheet('model');
   } else {
     note(msg, 'err');
   }
@@ -1866,8 +1869,106 @@ document.addEventListener('keyup', (e) => {
   if (e.code === 'Space' && pttOn) pttSet(false);
 });
 
-// settings sheet
-const openSheet = () => {
+/*
+ * The sheet was one long scroll in which the two fields that decide whether a call works
+ * at all — the key and the row — sat underneath earcon preferences. Ten panels, one topic
+ * each, in the order you would actually fill them in, and the current one is in the URL:
+ * when the diagnosis says "fix it in the Model box", that sentence can be a link, and a
+ * person on a phone can land on the one box they need instead of hunting for it.
+ *
+ * replaceState, not pushState. A dialog that the Back button walks through, panel by
+ * panel, is a dialog you cannot leave: one press of the phone's back key should end the
+ * detour, not step back to 'Key'. So the hash says *where you are*, and Esc closes.
+ */
+const PANELS = ['key', 'model', 'voice', 'audition', 'turns', 'session', 'words', 'comfort', 'quality', 'phone'];
+const PANEL_NAMES = {
+  key: 'Key', model: 'Model row', voice: 'Voice', audition: 'Hear it', turns: 'Turns',
+  session: 'Session frame', words: 'Its words', comfort: 'Comfort', quality: 'Quality',
+  phone: 'Phone call',
+};
+/** Where focus lands in each panel — a panel with no field still has to hold the focus. */
+const PANEL_FOCUS = {
+  key: 'fKey', model: 'fModel', voice: 'fVoice', audition: 'fAudition', turns: 'fVad',
+  session: 'fCaps', words: 'fGreet', comfort: 'fMotion', quality: 'statsReset',
+  phone: 'sheetClose',
+};
+let panel = 'key';
+const panelFromHash = () => {
+  const m = /setup-([a-z]+)/.exec((typeof location !== 'undefined' && location.hash) || '');
+  return m && PANELS.includes(m[1]) ? m[1] : '';
+};
+const writeHash = () => {
+  const want = '#setup-' + panel;
+  try {
+    if (typeof history !== 'undefined' && history.replaceState) history.replaceState(null, '', want);
+    else if (typeof location !== 'undefined') location.hash = want;
+  } catch {}
+};
+const clearHash = () => {
+  try {
+    if (typeof history !== 'undefined' && history.replaceState) {
+      history.replaceState(null, '', location.pathname + location.search);
+    } else if (typeof location !== 'undefined') location.hash = '';
+  } catch {}
+};
+const showPanel = (name, opts = {}) => {
+  if (!PANELS.includes(name)) return false;
+  const moving = name !== panel;
+  panel = name;
+  for (const p of PANELS) {
+    const sec = $('p-' + p), tab = $('t-' + p);
+    if (sec) sec.hidden = p !== name;
+    // 'false', not removal: aria-current="" on ten tabs reads as "all of them are here".
+    if (tab) tab.setAttribute('aria-current', p === name ? 'true' : 'false');
+  }
+  const title = $('sheetTitle');
+  if (title) title.textContent = `Setup · ${PANEL_NAMES[name]}`;
+  const prev = $('panelPrev'), next = $('panelNext');
+  const i = PANELS.indexOf(name);
+  // Disabled rather than hidden or wrapped: a stepper that loops tells you nothing about
+  // where you are, and one that vanishes looks like a bug in the page.
+  if (prev) prev.disabled = i === 0;
+  if (next) next.disabled = i === PANELS.length - 1;
+  writeHash();
+  if (opts.focus !== false && (moving || opts.force)) {
+    const target = $(PANEL_FOCUS[name]);
+    if (target && target.focus) setTimeout(() => target.focus(), 30);
+  }
+  return true;
+};
+const stepPanel = (dir) => {
+  const i = PANELS.indexOf(panel) + dir;
+  if (i >= 0 && i < PANELS.length) showPanel(PANELS[i]);
+};
+for (const p of PANELS) {
+  const b = $('t-' + p);
+  if (b) b.addEventListener('click', () => showPanel(p, { focus: false }));
+}
+$('panelNext').addEventListener('click', () => stepPanel(1));
+$('panelPrev').addEventListener('click', () => stepPanel(-1));
+// Left and right walk the panels — but only away from a field, or the arrow keys stop
+// being usable in a select and in the persona box.
+document.addEventListener('keydown', (e) => {
+  if (el.sheet.hidden) return;
+  const tag = ((e.target && e.target.tagName) || '').toUpperCase();
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+  if (e.code === 'ArrowRight') stepPanel(1);
+  else if (e.code === 'ArrowLeft') stepPanel(-1);
+});
+// A pasted #setup-model is an instruction from someone who already knows what you need to
+// change. Follow it, including while the sheet is open on another panel.
+if (typeof window !== 'undefined' && window.addEventListener) {
+  window.addEventListener('hashchange', () => {
+    const name = panelFromHash();
+    if (name) { if (el.sheet.hidden) openSheet(); else showPanel(name, { focus: false }); }
+    else if (!el.sheet.hidden) closeSheet();
+  });
+}
+
+// settings sheet. `wanted` is the panel a caller knows it needs — a retired row opens on
+// Model, not on the top of the sheet — and an explicit #setup-* hash outranks it, because
+// that is the person's own choice over the app's guess.
+const openSheet = (wanted) => {
   $('fKey').value = cfg.key;
   $('fModel').value = cfg.model;
   $('fVoice').value = cfg.voice;
@@ -1886,12 +1987,14 @@ const openSheet = () => {
   $('fCues').checked = a11y.cues;
   el.sheet.hidden = false;
   $('gearBtn').setAttribute('aria-expanded', 'true');
-  // Move focus into the dialog, then hand it back on close.
-  setTimeout(() => $('fKey').focus(), 30);
+  // Move focus into the dialog, then hand it back on close — into the panel that was
+  // asked for, which is the field the person came here to change.
+  showPanel(panelFromHash() || wanted || panel, { force: true });
 };
 const closeSheet = () => {
   el.sheet.hidden = true;
   $('gearBtn').setAttribute('aria-expanded', 'false');
+  clearHash();
   $('gearBtn').focus();
 };
 $('gearBtn').addEventListener('click', () => (el.sheet.hidden ? openSheet() : closeSheet()));
@@ -1908,6 +2011,20 @@ $('fVoice').addEventListener('change', () => {
 });
 $('fAudition').addEventListener('click', () => audition());
 $('fAuditionSave').addEventListener('click', () => downloadAudition());
+// The counters are the only evidence that a setting helped, so they need a zero. Without
+// one, "hybrid felt snappier" is a memory, and p95 carries every call since the reload.
+$('statsReset').addEventListener('click', () => {
+  stats.recv = 0; stats.lats = []; stats.deadair = 0; stats.falseCutoff = 0;
+  stats.interrupts = 0; stats.stalled = 0; stats.turnStart = 0; stats.firstByteAt = 0;
+  stats.tokens = 0;
+  el.sRecv.textContent = '0.0s';
+  el.sTurnLat.textContent = '–';
+  el.sSpread.textContent = '–';
+  el.sTokens.textContent = '0';
+  if (el.sTurnLat) el.sTurnLat.dataset.bad = '0';
+  if (el.sSpread) el.sSpread.dataset.bad = '0';
+  note('counters reset — p50/p95 measure from here', 'sys');
+});
 // The defaults improve; a copy saved last month does not. One click back, without
 // touching storage — saving stays an explicit act.
 $('fReset').addEventListener('click', () => {
@@ -1984,7 +2101,9 @@ $('sheetTest').addEventListener('click', async () => {
     save(cfg);
     if (cfg.keysafe) el.keyWarn.textContent = 'Server holds the key (proxy mode). Nothing to paste.';
   } catch {}
-  if (!cfg.key && !cfg.keysafe) {
+  if (!cfg.key && !cfg.keysafe || panelFromHash()) {
+    // Either we have nothing to work with, or the URL named a panel: both mean the sheet
+    // should be open when the page settles, on the panel that was asked for.
     openSheet();
   }
   if (!window.isSecureContext) {

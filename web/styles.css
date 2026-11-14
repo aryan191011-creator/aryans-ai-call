@@ -211,6 +211,10 @@ main { display: grid; grid-template-rows: auto 1fr; min-height: 0; }
   position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%);
   border: 1px solid var(--line); background: var(--surface-2); color: var(--ink);
   border-radius: 999px; padding: 8px 14px; font-size: .78rem; cursor: pointer; box-shadow: var(--shadow);
+  /* The one control that appears out of nowhere is the one most likely to be missed, and
+     a 35px pill on a phone is missed. It also has to be reachable one-handed while the
+     transcript is what you are looking at. */
+  min-height: 44px; display: inline-flex; align-items: center;
   animation: rise var(--dur) var(--ease) both;
 }
 
@@ -280,6 +284,9 @@ main { display: grid; grid-template-rows: auto 1fr; min-height: 0; }
 .sheet-card h2 small { color: var(--ink-3); font: 500 .68rem/1 ui-monospace, monospace; white-space: nowrap; }
 .field { display: block; margin-bottom: 12px; }
 .field > span { display: block; font-size: .78rem; color: var(--ink-2); margin-bottom: 6px; }
+/* The note under a field has to read as subordinate to the field, and the UA's `small`
+   alone leaves it at body colour — louder than the panel's own prose. */
+.field small { display: block; margin-top: 6px; font-size: .74rem; line-height: 1.45; color: var(--ink-2); }
 .field em { color: var(--you); font-style: normal; font-size: .72rem; }
 .field a { color: var(--ai); }
 input, select, textarea {
@@ -302,7 +309,7 @@ textarea { resize: vertical; }
    nothing on hover is read as a button that is broken — worse on a settings sheet where
    the user is already debugging a key. */
 .secondary {
-  min-height: 40px; padding: 0 14px; border-radius: 11px; cursor: pointer;
+  min-height: 44px; padding: 0 14px; border-radius: 11px; cursor: pointer;
   background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--line);
   font: 550 .8rem/1 ui-sans-serif, system-ui, sans-serif; text-align: left;
   transition: border-color .14s var(--ease), background .14s var(--ease), transform .1s var(--ease);
@@ -312,6 +319,58 @@ textarea { resize: vertical; }
 .secondary:focus-visible { outline: 2px solid var(--ai); outline-offset: 2px; }
 .secondary:disabled { opacity: .55; cursor: progress; border-style: dashed; }
 .ghost { min-height: 46px; padding: 0 16px; background: transparent; color: var(--ink-2); border: 1px solid var(--line); border-radius: 12px; cursor: pointer; font: 500 .85rem/1 ui-sans-serif, system-ui, sans-serif; }
+/* ── the setup panels ───────────────────────────────────────────────────────
+   The sheet holds ten panels. `.panel` is shown and hidden with the `hidden`
+   attribute and nothing else: any `display` rule on it would outrank the UA's
+   `[hidden]{display:none}` by cascade origin, and the whole sheet would collapse
+   into ten panels stacked on top of each other — the exact bug this file already
+   documents once. So the layout lives on `.panels` and the rail, never on the panel. */
+.sheet-card { display: grid; grid-template-rows: auto auto 1fr auto; min-height: 0; }
+.panels { overflow-y: auto; min-height: 0; padding-right: 2px; }
+.rail {
+  display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 4px;
+  scrollbar-width: thin;
+}
+.tab {
+  min-height: 44px; padding: 0 12px; border-radius: 11px; cursor: pointer;
+  background: var(--surface); color: var(--ink-3); border: 1px solid var(--line);
+  font: 550 .78rem/1 ui-sans-serif, system-ui, sans-serif;
+  display: inline-flex; align-items: center; gap: 7px;
+  transition: border-color .14s var(--ease), background .14s var(--ease), color .14s var(--ease);
+}
+.tab i { font-size: .95rem; font-style: normal; opacity: .85; }
+.tab:hover { color: var(--ink); border-color: var(--ink-3); }
+.tab:focus-visible { outline: 2px solid var(--ai); outline-offset: 2px; }
+.tab[aria-current="true"] {
+  color: var(--ink); border-color: color-mix(in oklab, var(--you) 55%, var(--line));
+  background: color-mix(in oklab, var(--you) 14%, var(--surface));
+}
+/* The rail is the only part of the sheet that is wayfinding, so it says which panel you
+   are on in more than colour: the active tab is filled and carries its own underline. */
+.tab[aria-current="true"]::after {
+  content: ""; display: block; width: 100%; height: 2px; border-radius: 2px;
+  background: var(--you); margin-top: 2px;
+}
+.panel { padding: 12px 0 4px; }
+.panel h3 { margin: 0 0 8px; font-size: .9rem; }
+.why { font-size: .76rem; line-height: 1.5; color: var(--ink-2); margin: 0 0 14px; max-width: 62ch; }
+.why b, .why code { color: var(--ink); }
+.why code { font: .74rem/1.4 ui-monospace, monospace; }
+.legend-list { list-style: none; margin: 0 0 14px; padding: 0; display: grid; gap: 7px; }
+.legend-list li {
+  font-size: .76rem; line-height: 1.5; color: var(--ink-2);
+  border-left: 2px solid var(--line); padding-left: 10px;
+}
+.legend-list b { color: var(--ink); font: 600 .76rem/1.4 ui-monospace, monospace; }
+.grow { flex: 1 1 auto; }
+#panelPrev, #panelNext { min-width: 46px; padding: 0; font-size: 1rem; }
+#panelPrev:disabled, #panelNext:disabled { opacity: .4; cursor: default; }
+@media (max-width: 560px) {
+  /* Ten tabs never fit a phone twice; scrolling the rail keeps every panel one tap away,
+     which wrapping into three rows of half-visible labels does not. */
+  .rail { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 4px; -webkit-overflow-scrolling: touch; }
+  .tab { flex: none; }
+}
 .log { margin: 12px 0 0; padding: 10px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; font: .7rem/1.5 ui-monospace, monospace; color: var(--ink-2); white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* ── layout: phone-first, then a real two-column when there is room ─────── */

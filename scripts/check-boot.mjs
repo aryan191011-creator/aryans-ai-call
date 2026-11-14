@@ -17,6 +17,10 @@ import { fileURLToPath } from 'node:url';
 
 const SRC = fileURLToPath(new URL('../web/app.js', import.meta.url));
 const app = fs.readFileSync(SRC, 'utf8');
+// Read alongside app.js, so any check in the file — not only the ones written near the
+// bottom — can compare the three files against each other.
+const css = fs.readFileSync(fileURLToPath(new URL('../web/styles.css', import.meta.url)), 'utf8');
+const html = fs.readFileSync(fileURLToPath(new URL('../web/index.html', import.meta.url)), 'utf8');
 
 // ── stub DOM ───────────────────────────────────────────────────────────────
 class El {
@@ -79,6 +83,9 @@ const document = {
   createElement: (t) => new El(t),
   addEventListener: (ev, fn) => (docHandlers[ev] ??= []).push(fn),
 };
+/** Fire an event the way the document does, so handlers registered with
+ *  document.addEventListener run with the target the real browser would give them. */
+const docFire = (ev, e) => { for (const fn of docHandlers[ev] || []) fn(e); };
 const store = new Map();
 const localStorage = {
   getItem: (k) => (store.has(k) ? store.get(k) : null),
@@ -352,6 +359,210 @@ check('the trigger and the persona cannot drift apart', () => {
     'DEFAULT_PROMPT does not document the token it is sent');
 });
 
+// ── the ten setup panels ──────────────────────────────────────────────────
+const PANEL_IDS = ['key', 'model', 'voice', 'audition', 'turns', 'session', 'words', 'comfort', 'quality', 'phone'];
+check('the markup, the rail and the app agree on the ten panels, in order', () => {
+  // Three lists of the same ten names, in three files. Two of them drifting is invisible
+  // in a browser (a tab that shows nothing) and invisible in this harness (getElementById
+  // happily invents the element), so the only fix is to compare them here.
+  const declared = [...html.matchAll(/<section class="panel" id="p-([a-z]+)" data-panel="([a-z]+)" hidden>/g)];
+  assert.deepEqual(declared.map((m) => m[1]), PANEL_IDS, 'the sections in the markup are not the ten panels');
+  assert.deepEqual(declared.map((m) => m[1]), declared.map((m) => m[2]), 'id and data-panel disagree on a section');
+  const tabs = [...html.matchAll(/class="tab" id="t-([a-z]+)" data-panel="([a-z]+)"/g)];
+  assert.deepEqual(tabs.map((m) => m[1]), PANEL_IDS, 'the rail is not the same ten, in the same order');
+  assert.deepEqual(tabs.map((m) => m[2]), tabs.map((m) => m[1]), 'id and data-panel disagree on a tab');
+  const js = [...app.matchAll(/const PANELS = \[([^\]]*)\]/g)][0][1].split(',').map((x) => x.trim().replace(/'/g, '')).filter(Boolean);
+  assert.deepEqual(js, PANEL_IDS, 'app.js PANELS drifted from the markup');
+  const names = app.slice(app.indexOf('const PANEL_NAMES'), app.indexOf('const PANEL_FOCUS'));
+  for (const id of PANEL_IDS) assert.ok(names.includes(`${id}:`), `PANEL_NAMES has no entry for ${id}`);
+});
+
+check('every field lives in exactly one panel, and no field was dropped', () => {
+  // A restructure loses a field by accident more often than it gains one on purpose: a
+  // duplicated id means the second one is never read, and an orphan means the setting
+  // exists in code and nowhere you can touch it.
+  const sheet = html.slice(html.indexOf('<div class="panels">'), html.indexOf('</div>\n\n    <div class="sheet-actions">'));
+  const ids = [...sheet.matchAll(/id="(f[A-Za-z]+|keyWarn|statsReset)"/g)].map((m) => m[1]);
+  const dupes = ids.filter((x, i) => ids.indexOf(x) !== i);
+  assert.deepEqual(dupes, [], 'a field id appears in two panels: ' + dupes.join(', '));
+  const wanted = ['fKey', 'fModel', 'fVoice', 'fTone', 'fSample', 'fAudition', 'fVad', 'fHybrid',
+    'fGuard', 'fCaps', 'fGreet', 'fPrompt', 'fMotion', 'fContrast', 'fScale', 'fCues', 'keyWarn'];
+  const missing = wanted.filter((w) => !ids.includes(w));
+  assert.deepEqual(missing, [], 'settings the sheet no longer has: ' + missing.join(', '));
+  assert.equal((sheet.match(/id="fPrompt"/g) || []).length, 1, 'the persona box was pasted twice');
+  // The log is deliberately NOT in a panel: the audition writes it, Test connection writes
+  // it, and a failure can land on either from any panel. Inside a panel it would be
+  // invisible half the time — the classic "where did my error message go".
+  const panelsHtml = html.slice(html.indexOf('<div class="panels">'), html.indexOf('</div>\n\n    <div class="sheet-actions">'));
+  assert.ok(!panelsHtml.includes('id="sheetLog"'), 'the log was buried inside one panel');
+  assert.ok(html.indexOf('id="sheetLog"') > html.indexOf('id="sheet-actions"'.replace('id=', 'class=')),
+    'the log is not below the actions it is meant to follow');
+});
+
+// Every panel check starts from the same deterministic state: a closed sheet, no hash,
+// then an open one on the named panel. Without that, each one inherits whatever the last
+// check left behind — and an assertion that reads a state its own body did not set is a
+// check that passes for the wrong reason.
+const openOn = (name) => {
+  if (reg.get('sheet').hidden === false) reg.get('sheetClose').fire('click');
+  // Arrive by hash rather than by clicking the tab: that is the one route that runs
+  // openSheet's focus hand-off, so the checks below can see where focus lands.
+  sandbox.location.hash = name ? '#setup-' + name : '';
+  reg.get('gearBtn').fire('click');
+};
+
+check('one panel is showing, the other nine are not', () => {
+  openOn('key');
+  const shown = PANEL_IDS.filter((n) => reg.get('p-' + n).hidden === false);
+  assert.deepEqual(shown, ['key'], `expected only the Key panel, got ${JSON.stringify(shown)}`);
+  assert.match(reg.get('sheetTitle').textContent, /Setup · Key/);
+});
+check('a panel is only reachable through its own rail button', () => {
+  openOn('quality');
+  assert.equal(PANEL_IDS.filter((n) => reg.get('p-' + n).hidden === false).length, 1, 'two panels visible at once');
+  assert.equal(reg.get('p-key').hidden, true, 'the previous panel is still on screen too');
+  assert.match(reg.get('sheetTitle').textContent, /Quality/, 'the dialog heading still names the old panel');
+});
+check('the rail says where you are, to a screen reader too', () => {
+  openOn('quality');
+  // aria-current="" on all ten is the same as aria-current on none of them.
+  for (const n of PANEL_IDS) {
+    const want = n === 'quality' ? 'true' : 'false';
+    assert.equal(reg.get('t-' + n).getAttribute('aria-current'), want,
+      `t-${n} said aria-current=${reg.get('t-' + n).getAttribute('aria-current')}, wanted ${want}`);
+  }
+});
+// Focus moves on a timer (a dialog that grabs it before paint is a dialog that loses it
+// on iOS), so the table is collected across awaits and asserted once — a check() body
+// cannot await, and a rejection inside one is never seen.
+const focusTable = /const PANEL_FOCUS = \{([\s\S]*?)\n\};/.exec(app)[1];
+const focusRows = [...focusTable.matchAll(/(\w+): '([A-Za-z]+)'/g)].map((m) => [m[1], m[2]]);
+const focusSeen = [];
+for (const [name, target] of focusRows) {
+  openOn(name);
+  await tick(50);
+  focusSeen.push([name, target, reg.get(target)._focused === true]);
+}
+check('focus lands on the field this panel is about', () => {
+  // aria-modal dialogs must keep the tab ring inside, and focus on a *hidden* field puts
+  // the caret somewhere nobody can see — the classic one-keyboard-stuck-in-the-void bug.
+  assert.equal(focusRows.length, PANEL_IDS.length, 'PANEL_FOCUS is not one entry per panel');
+  for (const name of PANEL_IDS) assert.ok(focusRows.some(([n]) => n === name), `PANEL_FOCUS has no ${name}`);
+  for (const [name, target, seen] of focusSeen) {
+    const body = html.slice(html.indexOf(`id="p-${name}"`), html.indexOf(`id="p-${name}"`) + 5200);
+    assert.ok(body.includes(`id="${target}"`) || name === 'phone',
+      `${name} focuses #${target}, which is not inside it`);
+    assert.ok(seen, `${name} did not move focus to #${target}`);
+  }
+});
+check('the rail is how you move, not a label strip', () => {
+  // openOn arrives by hash, so nothing else in this suite proves the tabs do anything —
+  // and a tab that only paints, without moving the panel or the URL, is the bug.
+  openOn('key');
+  reg.get('t-voice').fire('click');
+  assert.equal(reg.get('p-voice').hidden, false, 'clicking the Voice tab changed nothing');
+  assert.equal(reg.get('p-key').hidden, true, 'the old panel is still up');
+  assert.equal(sandbox.location.hash, '#setup-voice', 'moving panel left the URL where it was');
+});
+
+check('the stepper stops at both ends instead of looping', () => {
+  openOn('key');
+  assert.equal(reg.get('panelPrev').disabled, true, 'Back is live on the first panel');
+  assert.equal(reg.get('panelNext').disabled, false, 'Next is dead on the first panel');
+  reg.get('panelNext').fire('click');
+  assert.equal(reg.get('p-model').hidden, false, 'Next did not step');
+  openOn('phone');
+  assert.equal(reg.get('panelNext').disabled, true, 'Next is live on the last panel');
+  reg.get('panelNext').fire('click');
+  assert.equal(reg.get('p-phone').hidden, false, 'stepping past the end moved anyway');
+});
+check('nothing you can press lives inside a <label>', () => {
+  // A button or a link nested in a <label> belongs to the labelled control: clicking it
+  // focuses (and for a checkbox, toggles) that control, so "restore the built-in defaults"
+  // also puts the caret in the persona box, and a screen reader reads the link text as part
+  // of the field name. Two fields were built like that; the rule keeps them from creeping back.
+  const offenders = [];
+  for (const m of html.matchAll(/<label\b[^>]*>([\s\S]*?)<\/label>/g)) {
+    const inner = m[1];
+    for (const t of inner.matchAll(/<(button|a)\b/g)) offenders.push(t[1]);
+  }
+  assert.deepEqual([...new Set(offenders)], [],
+    'interactive elements nested in a label: ' + [...new Set(offenders)].join(', '));
+  // And the two fields that used to be nested keep their accessible name.
+  for (const [id, by] of [['fKey', 'keyLabel'], ['fPrompt', 'promptLabel']]) {
+    assert.ok(html.includes(`id="${by}"`), `${id} lost its label element`);
+    assert.match(html, new RegExp(`id="${id}"[\\s\\S]{0,160}?aria-labelledby="${by}"`), `${id} is unlabelled`);
+  }
+});
+
+check('the panel you are on is in the URL, and a pasted link opens it', () => {
+  // The diagnosis says "pick another row"; the sentence is only worth anything if it can
+  // be a link that lands on the one box that fixes the call.
+  openOn('model');
+  assert.equal(sandbox.location.hash, '#setup-model', 'the hash does not say where you are: ' + sandbox.location.hash);
+  reg.get('sheetClose').fire('click');
+  assert.equal(sandbox.location.hash, '', 'closing left a panel in the URL');
+  sandbox.location.hash = '#setup-quality';
+  reg.get('gearBtn').fire('click');
+  assert.equal(reg.get('p-quality').hidden, false, 'a deep link opened the sheet on the wrong panel');
+  assert.equal(reg.get('p-model').hidden, true, 'the deep link stacked two panels');
+  sandbox.location.hash = '#setup-nonsense';
+  reg.get('sheetClose').fire('click');
+  reg.get('gearBtn').fire('click');
+  assert.equal(PANEL_IDS.filter((n) => reg.get('p-' + n).hidden === false).length, 1,
+    'an unknown #setup-* left the sheet with no panel, or with two');
+  sandbox.location.hash = '';
+});
+check('Esc closes from any panel and takes the hash with it', () => {
+  openOn('comfort');
+  docFire('keydown', { code: 'Escape', target: reg.get('p-comfort') });
+  assert.equal(reg.get('sheet').hidden, true, 'Esc did not close the sheet from a panel');
+  assert.equal(sandbox.location.hash, '', 'the URL still claims a panel that is not on screen');
+  assert.equal(reg.get('gearBtn')._focused, true, 'focus was not handed back to the gear');
+});
+check('the arrow keys walk the rail, but not out of a field', () => {
+  openOn('turns');
+  docFire('keydown', { code: 'ArrowRight', target: reg.get('nothing') });
+  assert.equal(reg.get('p-session').hidden, false, 'ArrowRight did not step');
+  // In a real browser a keydown inside <select> targets the select, whose tagName is
+  // SELECT; the fake El has no tagName, so what is provable here is the guard itself —
+  // without it, arrow keys stop being usable in the persona box and in every dropdown.
+  assert.match(app, /tagName\) \|\| ''\)\.toUpperCase\(\)/, 'no tag sniffing on the arrow handler');
+  assert.match(app, /INPUT' \|\| tag === 'TEXTAREA' \|\| tag === 'SELECT'/, 'the guard does not cover the fields');
+  // #setup-typo must not invent a section: getElementById happily creates one in this
+  // harness and in a browser it gives you a sheet with nothing in it, so the guard is the
+  // only thing standing between a mistyped link and a blank dialog.
+  assert.match(app, /PANELS\.includes\(m\[1\]\)/, 'the hash is not validated against the panel list');
+  assert.match(app, /if \(!PANELS\.includes\(name\)\) return false;/, 'showPanel accepts any name');
+});
+// Build a measurement first, then zero it: an assertion that the counters read 0.0s
+// proves nothing if they never read anything else.
+openOn('quality');
+sockets.at(-1).from({ serverContent: { modelTurn: { parts: [{ inlineData: { data: Buffer.alloc(4800, 3).toString('base64') } }] } } });
+await tick(320);
+const metersBefore = ['sRecv', 'sCalls', 'sTokens'].map((id) => reg.get(id).textContent);
+check('the counters can be zeroed, from the panel that explains them', () => {
+  // Measured before and after a change is the only way to know a setting helped. With no
+  // zero, "hybrid felt snappier" is a memory and p95 still carries every call since the
+  // reload — so the number that looks like evidence is not.
+  assert.ok(metersBefore[0] !== '0.0s', 'precondition: nothing was measured to reset');
+  reg.get('statsReset').fire('click');
+  assert.equal(reg.get('sRecv').textContent, '0.0s', 'audio played did not go back to zero');
+  assert.equal(reg.get('sTokens').textContent, '0', 'tokens were not reset');
+  assert.equal(reg.get('sTurnLat').textContent, '–', 'the turn number survived the reset');
+  assert.equal(reg.get('sSpread').textContent, '–', 'p50/p95 survived the reset');
+  assert.match(reg.get('thread').children.at(-1).text(), /from here/i, 'no note saying what the zero means');
+});
+
+check('the sheet is a grid that scrolls its panels, not its shell', () => {
+  // .sheet-card owns the scroll: if a .panel did, the rail and the Save button would
+  // slide away mid-form, and each panel would remember its own scroll position badly.
+  assert.match(css, /\.sheet-card \{[^}]*grid-template-rows: auto auto 1fr auto/, 'the card is not rowed');
+  assert.match(css, /\.panels \{[^}]*overflow-y: auto/, 'the panel area does not scroll');
+  assert.ok(!/\.panel \{[^}]*display/.test(css), 'a display rule on .panel outranks [hidden]');
+  assert.match(css, /\.tab\[aria-current="true"\][^{]*\{[^}]*background/, 'the active tab is only distinguished by colour');
+});
+
 // drive the mic: loud 2048-sample blocks must become 16 kHz PCM frames
 check('mic frames reach the socket as audio/pcm;rate=16000', () => {
   assert.ok(procs.length >= 1, 'no script processor was created');
@@ -497,8 +708,6 @@ check('hangup returns to idle without throwing', () => {
 // real child, so check the contract that actually matters instead: every class
 // app.js queries by must exist in the stylesheet. Rename '.tx' to '.textx' and
 // this goes red even when the fake DOM happily swallows it.
-const css = fs.readFileSync(fileURLToPath(new URL('../web/styles.css', import.meta.url)), 'utf8');
-const html = fs.readFileSync(fileURLToPath(new URL('../web/index.html', import.meta.url)), 'utf8');
 check('every queried class exists in the stylesheet', () => {
   const sel = [...app.matchAll(/querySelector\('\.([A-Za-z0-9_-]+)'\)/g)].map((m) => m[1]);
   const orphans = [...new Set(sel)].filter((c) => !css.includes('.' + c));
@@ -602,18 +811,32 @@ check('light scheme defined, not just inverted dark', () => {
   assert.match(css, /@media \(prefers-color-scheme: light\)/);
   assert.match(css, /@media \(prefers-contrast: more\)/);
 });
-check('touch targets are at least 44px', () => {
-  for (const cls of ['push', 'icon-btn', 'send', 'primary', 'ghost']) {
-    // Base selector only: `.icon-btn svg` and `.push .glyph` legitimately have
-    // no min-height of their own, and matching them would make this check fail
-    // for reasons that have nothing to do with tap targets.
-    const blocks = [...css.matchAll(new RegExp('\\.' + cls + '\\s*(?:,\\s*\.' + cls + ')*\\s*\{([^}]*)\}', 'g'))];
-    const ok = blocks.some(([, body]) => {
-      const m = /min-height:\s*(\d+)px/.exec(body);
-      return m && Number(m[1]) >= 44;
-    });
-    assert.ok(ok, '.' + cls + ' has no min-height >= 44px on its base rule');
+check('every button in the markup meets a tap target, derived from the markup', () => {
+  // This check used to list five class names by hand, which meant a sixth was unmeasured:
+  // the setup rail's tabs were 44px only because someone felt like it. Now the requirement
+  // is read off the page — add a button class and it has to satisfy it.
+  // `.linklike` is the one exemption, at 24px: it is a text-sized affordance inside a
+  // sentence, and forcing 44 would break the line it sits in (2.5.8's minimum, not 2.5.5's).
+  const inline = new Set(['linklike']);
+  const classes = new Set();
+  for (const m of html.matchAll(/<button[^>]*class="([^"]+)"/g)) {
+    for (const c of m[1].trim().split(/\s+/)) classes.add(c);
   }
+  assert.ok(classes.size >= 9, 'only found ' + classes.size + ' button classes — the scan is broken');
+  const minHeight = (c) => {
+    const blocks = [...css.matchAll(new RegExp('\\.' + c + '\\s*(?:,\\s*\\.' + c + ')*\\s*\\{([^}]*)\\}', 'g'))];
+    return Math.max(0, ...blocks.map(([, body]) => Number((/min-height:\s*(\d+)px/.exec(body) || [])[1] || 0)));
+  };
+  const offenders = [];
+  // Judged per element, not per class: `class="icon-btn ptt"` is held open by .icon-btn's
+  // 44, and a per-class rule would demand a second one for no reason.
+  for (const m of html.matchAll(/<button[^>]*class="([^"]+)"/g)) {
+    const cs = m[1].trim().split(/\s+/);
+    const want = cs.every((c) => inline.has(c)) ? 24 : 44;
+    const got = Math.max(...cs.map(minHeight));
+    if (got < want) offenders.push(`[${cs.join('.')}] ${got}px < ${want}px`);
+  }
+  assert.deepEqual([...new Set(offenders)], [], 'tap targets too small: ' + [...new Set(offenders)].join(', '));
 });
 check('audio cues stay under 150ms so they do not mask the first phoneme', () => {
   const m = [...app.matchAll(/t \+ (0\.\d+)/g)].map((x) => Number(x[1]));
@@ -1114,6 +1337,15 @@ check('the spinner cannot last forever: deadline armed, deduped, cancelled on su
   assert.match(app, /clearTimeout\(handshakeTimer\);\n\s*handshakeTries = 0;/, 'setupComplete must cancel the deadline');
   assert.match(app, /handshakeTries >= 2/, 'no cap on retries — a dead network would loop forever');
   assert.match(app, /Stopping here rather than retrying forever/);
+});
+
+check('the failure that needs a new row opens the panel that has it', () => {
+  // The whole point of splitting the sheet into panels is this: a retired row is fixed in
+  // one box, and "go change it in the settings" makes the caller hunt through a form while
+  // the call is dead. So the link is not a nicety, it is the repair step.
+  const err = /function reportError\(err\) \{([\s\S]*?)\n\}/.exec(app)[1];
+  assert.match(err, /NOT_FOUND\|404\|no such model\|unsupported/, 'the retired-row test is gone');
+  assert.match(err, /openSheet\('model'\)/, 'the row failure no longer lands on the Model panel');
 });
 
 check('a thrown WebSocket constructor is reported, not swallowed', () => {

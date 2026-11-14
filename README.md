@@ -54,6 +54,7 @@ claimed here.
 | Barge-in is a **policy**, not a boolean | A short vocalisation ducks the agent to 35% and recovers; committed speech (>300 ms) cuts it; `ruko / stop / ruko` cuts on *words* from the transcript even before energy would; `Esc` always cuts |
 | Cover any pause approaching **2 s** | A dead-air watchdog at 1800 ms says so in the UI and increments a counter — dead-air p95 is measured, not shrugged at |
 | Audio cues must stay **under 150 ms** or they mask the first phoneme | Earcons are 110 ms with a 130 ms ceiling, synthesised in WebAudio (no asset, no network), mirrored as haptics, and can't take down a call if the node is missing |
+| A modal that opens on the wrong field loses the keyboard | Focus moves to the field the panel is about (`#statsReset` on Quality, Close on the one panel with nothing to edit), and `Esc` from any panel closes the dialog and takes the hash with it |
 | A live region inserted *with* its content is silent | `#a11yStatus` ships in the initial HTML with `role="status"` + `aria-live="polite"`; the transcript is `role="log"` polite so it announces without stealing focus |
 | A pulsing background is invisible to assistive tech | The mic control is a real APG toggle button; `aria-pressed` tracks the session, and mute sets both `aria-pressed` and a matching `aria-label` |
 | Auto-scroll must not yank a reader who scrolled up | `stick()` only follows while pinned within 90 px of the bottom; otherwise a "New reply ↓" pill appears and the scroll position is left alone |
@@ -90,6 +91,17 @@ Design decisions worth defending:
 - **The dialog closes by every route a person tries**: the × button, Save, `Esc`, and a
   tap on the dimmed backdrop. A press that starts on a field and releases over the
   backdrop does not close it, so half-typed input is never lost.
+- **The setup sheet is ten panels, and the current one is in the URL.** It was one long
+  scroll in which the two fields that decide whether a call works at all — the key and the
+  row — sat underneath an earcon preference. Now: Key, Model row, Voice, Hear it, Turns,
+  Session frame, Its words, Comfort, Quality, Phone call, in the order you would fill them
+  in. `history.replaceState`, deliberately not `pushState`: a dialog the Back button walks
+  panel by panel is a dialog you cannot leave, and one press of a phone's back key should
+  end the detour, not step back to *Key*. The hash still names the panel, so a failure can
+  say "pick another row" and open the Model panel itself — which is the repair step, not a
+  hint. Layout rule with a test behind it: `.panel` gets no `display` property, because a
+  `display` on an element hidden with `hidden` wins on cascade origin and the sheet would
+  show all ten panels stacked.
 - **There is a text field.** "I am on a bus" is a normal reason voice fails, and a
   voice-first UI that offers no keyboard fallback just loses the call.
 - **Suggested openers replace the empty state.** Voice has no buttons, so
@@ -117,8 +129,10 @@ Exactly one thing changes per attempt, so a success means something. Rows are ra
 newest-major first, and `native-audio` above a text-only row of the same generation, because
 a row that connects and then has nothing to play is misread as an audio bug forever. The
 probe is not name-only either: `gemini-2.5-flash-native-audio-preview-*` is a Live row that
-never says "live", and missing it produces a confident, wrong sentence about *your key*. Settings shows how many Live rows your key can see and
-flags a current row it cannot find **before** you press Start.
+never says "live", and missing it produces a confident, wrong sentence about *your key*.
+Settings → **Model row** shows how many Live rows your key can see and flags a current row it
+cannot find **before** you press Start — and when a call fails that way anyway, the sheet
+reopens itself on that panel rather than at the top.
 
 Two things found on the way, both real:
 

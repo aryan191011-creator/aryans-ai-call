@@ -138,27 +138,62 @@
 <!-- ── settings sheet ─────────────────────────────────────────────────── -->
 <div class="sheet" id="sheet" hidden>
   <div class="sheet-card" role="dialog" aria-modal="true" aria-labelledby="sheetTitle">
-    <h2 id="sheetTitle">Setup <small>₹0 — free tiers only</small></h2>
+    <h2 id="sheetTitle">Setup</h2>
 
-    <label class="field">
-      <span>Gemini API key <em>free, no card</em> — <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer">aistudio.google.com/apikey</a></span>
-      <input id="fKey" type="password" autocomplete="off" spellcheck="false" placeholder="AIza…" />
-    </label>
+    <nav class="rail" aria-label="Setup sections">
+      <button type="button" class="tab" id="t-key" data-panel="key" aria-current="true"><i aria-hidden="true">🔑</i>Key</button>
+      <button type="button" class="tab" id="t-model" data-panel="model"><i aria-hidden="true">🧠</i>Model row</button>
+      <button type="button" class="tab" id="t-voice" data-panel="voice"><i aria-hidden="true">🗣</i>Voice</button>
+      <button type="button" class="tab" id="t-audition" data-panel="audition"><i aria-hidden="true">🎧</i>Hear it</button>
+      <button type="button" class="tab" id="t-turns" data-panel="turns"><i aria-hidden="true">⏱</i>Turns</button>
+      <button type="button" class="tab" id="t-session" data-panel="session"><i aria-hidden="true">🧩</i>Session frame</button>
+      <button type="button" class="tab" id="t-words" data-panel="words"><i aria-hidden="true">💬</i>Its words</button>
+      <button type="button" class="tab" id="t-comfort" data-panel="comfort"><i aria-hidden="true">👀</i>Comfort</button>
+      <button type="button" class="tab" id="t-quality" data-panel="quality"><i aria-hidden="true">📈</i>Quality</button>
+      <button type="button" class="tab" id="t-phone" data-panel="phone"><i aria-hidden="true">📞</i>Phone call</button>
+    </nav>
 
-    <label class="field">
-      <span>Model</span>
-      <input id="fModel" list="modelList" value="models/gemini-3.1-flash-live-preview" />
-      <datalist id="modelList">
-        <option value="models/gemini-3.8-live"></option>
-        <option value="models/gemini-3.1-flash-live-preview"></option>
-        <option value="models/gemini-2.5-flash-native-audio-preview-12-2025"></option>
-        <option value="models/gemini-live-2.5-flash-native-audio"></option>
-      </datalist>
-      <small id="modelHint">One Google row does everything here — hearing, deciding, and speaking. Free-tier rows move every few weeks; this is checked against your key when you save, and a row your key cannot see fails as a dead socket, not as an error message.</small>
-    </label>
+    <div class="panels">
 
-    <div class="row">
-      <label class="field half">
+    <section class="panel" id="p-key" data-panel="key" hidden>
+      <p class="why">₹0 — free tiers only. One Google key, no card. It is the only secret in this app,
+      which is why there is a mode where the browser never holds it.</p>
+      <div class="field">
+        <span id="keyLabel">Gemini API key</span>
+        <input id="fKey" type="password" autocomplete="off" spellcheck="false" placeholder="AIza…"
+               aria-labelledby="keyLabel" />
+        <small>Free, no card: <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer">aistudio.google.com/apikey</a></small>
+      </div>
+      <p class="keywarn" id="keyWarn">
+        Key lives in <code>localStorage</code> on this device and goes straight to Google.
+        Server-side instead: <code>PROXY=1 GEMINI_API_KEY=… npm i ws &amp;&amp; npm start</code>.
+      </p>
+    </section>
+
+    <section class="panel" id="p-model" data-panel="model" hidden>
+      <p class="why">One row hears you, decides, and speaks — the call and the voice preview
+      use this same row. Pick it here, not in code.</p>
+      <label class="field">
+        <span>Model</span>
+        <input id="fModel" list="modelList" value="models/gemini-3.1-flash-live-preview" />
+        <datalist id="modelList">
+          <option value="models/gemini-3.8-live"></option>
+          <option value="models/gemini-3.1-flash-live-preview"></option>
+          <option value="models/gemini-2.5-flash-native-audio-preview-12-2025"></option>
+          <option value="models/gemini-live-2.5-flash-native-audio"></option>
+        </datalist>
+        <small id="modelHint">Free-tier rows move every few weeks; this is checked against
+        your key when you save, and a row your key cannot see fails as a dead socket, not as
+        an error message.</small>
+      </label>
+      <p class="why">Test connection asks your key which Live rows exist and retries once per
+      change, so a retired name is never blamed on you.</p>
+    </section>
+
+    <section class="panel" id="p-voice" data-panel="voice" hidden>
+      <p class="why">The voice name goes into the Live setup frame, where the row actually
+      reads it. Adjectives are not enough — hear it on the next tab.</p>
+      <label class="field">
         <span>Voice <em>all 30, by ear</em></span>
         <select id="fVoice">
           <option value="Sulafat" selected>Sulafat · Warm · F</option>
@@ -195,74 +230,7 @@
         <small id="voiceHint">Sulafat · Warm — a soft, unhurried read. The default for a phone
         assistant; Kore and Charon are firmer if you want authority.</small>
       </label>
-      <label class="field half">
-        <span>Turn detection</span>
-        <select id="fVad">
-          <option value="server">Server VAD (hands-free)</option>
-          <option value="ptt">Push to talk (my own VAD)</option>
-        </select>
-      </label>
-    </div>
-
-    <label class="check">
-      <input id="fHybrid" type="checkbox" checked />
-      <span>Finish my turn when I stop — tell the model the sentence is over instead of
-      waiting out its ~800 ms silence timer. Cuts the pause after every line; untick if it
-      ever cuts you off.</span>
-    </label>
-
-    <label class="field">
-      <span>Session features <em>what the setup frame is allowed to ask for</em></span>
-      <select id="fCaps">
-        <option value="auto" selected>Auto — judged by the model row</option>
-        <option value="full">Full — word-timed captions, Hinglish vocabulary, resumable line</option>
-        <option value="lean">Lean — the smallest frame every Live row accepts</option>
-      </select>
-      <small>Full adds the newer fields (transcription biasing, resumption, streaming
-      captions). Some rows reject a field they do not know — and a rejected setup is a
-      dead socket, not an error. Auto asks for them only on rows that document them;
-      pick Lean if a row misbehaves, Full if you are on a new row and want the captions.</small>
-    </label>
-
-    <label class="check">
-      <input id="fGuard" type="checkbox" checked />
-      <span>Half-duplex guard — stop sending my mic while the agent talks. Essential on
-      laptop speakers; untick with headphones for true interruption.</span>
-    </label>
-
-    <fieldset class="a11y">
-      <legend>Accessibility <span>persisted on this device</span></legend>
-      <label class="field third">
-        <span>Motion</span>
-        <select id="fMotion">
-          <option value="system">System (prefers-reduced-motion)</option>
-          <option value="reduce">Reduce</option>
-          <option value="no-preference">Full</option>
-        </select>
-      </label>
-      <label class="field third">
-        <span>Contrast</span>
-        <select id="fContrast">
-          <option value="system">System</option>
-          <option value="more">High</option>
-        </select>
-      </label>
-      <label class="field third">
-        <span>Text size</span>
-        <select id="fScale">
-          <option value="1">Default</option>
-          <option value="1.15">Large</option>
-          <option value="1.3">Largest</option>
-        </select>
-      </label>
-      <label class="check">
-        <input id="fCues" type="checkbox" checked />
-        <span>Earcons — 120 ms blips on mic open/close. Kept under 150 ms so they never mask the first phoneme.</span>
-      </label>
-    </fieldset>
-
-    <div class="row">
-      <label class="field half">
+      <label class="field">
         <span>Voice feel <em>applied to what you hear</em></span>
         <select id="fTone">
           <option value="natural" selected>Natural — light polish</option>
@@ -273,38 +241,158 @@
         <small>A gentle EQ and compressor on the output. Zero cost, no network. Try
         <b>Warm</b> on laptop speakers, <b>Clear</b> on a phone.</small>
       </label>
-      <label class="field half">
+    </section>
+
+    <section class="panel" id="p-audition" data-panel="audition" hidden>
+      <p class="why">A throwaway Live session — no microphone, no persona, nothing saved.
+      It costs one request and speaks through the same chain as a call, so this is the
+      sound you will actually hear.</p>
+      <label class="field">
         <span>Audition line <em>the call model reads this, out loud</em></span>
         <input id="fSample" type="text" autocomplete="off"
                value="Theek hai, main note kar leta hoon. Aur kuch chahiye aapko?" />
+      </label>
+      <div class="row">
         <button class="secondary" id="fAudition" type="button">▶ Hear this voice</button>
         <button class="secondary" id="fAuditionSave" type="button" hidden>⬇ Save the sample (.wav)</button>
-        <small>A throwaway Live session with the voice you just picked — same row, same
-        voice feel chain, same speakers as the call. It costs one request; nothing else
-        about it touches your key or your history.</small>
+      </div>
+      <p class="why">No style directive is sent with the line: a Live session reads
+      instructions as content, so "say this warmly" comes back as the model saying the words.
+      Style belongs in the persona.</p>
+    </section>
+
+    <section class="panel" id="p-turns" data-panel="turns" hidden>
+      <p class="why">When a sentence ends is the whole difference between a conversation and
+      a walkie-talkie. Three knobs, and they pull against each other.</p>
+      <label class="field">
+        <span>Turn detection</span>
+        <select id="fVad">
+          <option value="server">Server VAD (hands-free)</option>
+          <option value="ptt">Push to talk (my own VAD)</option>
+        </select>
       </label>
+      <label class="check">
+        <input id="fHybrid" type="checkbox" checked />
+        <span>Finish my turn when I stop — tell the model the sentence is over instead of
+        waiting out its ~800 ms silence timer. Cuts the pause after every line; untick if it
+        ever cuts you off.</span>
+      </label>
+      <label class="check">
+        <input id="fGuard" type="checkbox" checked />
+        <span>Half-duplex guard — stop sending my mic while the agent talks. Essential on
+        laptop speakers; untick with headphones for true interruption.</span>
+      </label>
+      <p class="why">The guard disables barge-in on purpose: on speakers the agent hears
+      itself and interrupts itself into nonsense. Headphones users want it off, and that is
+      a decision, not a default to discover.</p>
+    </section>
+
+    <section class="panel" id="p-session" data-panel="session" hidden>
+      <p class="why">The setup frame is a proto: a field the row does not know is not
+      ignored, it is a rejected setup — which arrives as a dead socket that looks exactly
+      like a bad key. So the newer fields are asked for only where they are documented.</p>
+      <label class="field">
+        <span>Session features <em>what the setup frame is allowed to ask for</em></span>
+        <select id="fCaps">
+          <option value="auto" selected>Auto — judged by the model row</option>
+          <option value="full">Full — word-timed captions, Hinglish vocabulary, resumable line</option>
+          <option value="lean">Lean — the smallest frame every Live row accepts</option>
+        </select>
+        <small>Full adds the newer fields (transcription biasing, resumption, streaming
+        captions). Some rows reject a field they do not know — and a rejected setup is a
+        dead socket, not an error. Auto asks for them only on rows that document them;
+        pick Lean if a row misbehaves, Full if you are on a new row and want the captions.</small>
+      </label>
+    </section>
+
+    <section class="panel" id="p-words" data-panel="words" hidden>
+      <p class="why">What it says before you do, and how it behaves. The Live API has no
+      opening-message concept, so the first line is something this app sends you.</p>
+      <label class="field">
+        <span>Opening line <em>what it says the moment the call connects</em></span>
+        <input id="fGreet" type="text" autocomplete="off" />
+        <small>Sent as a system signal, never shown in the transcript. Without it the first
+        thing you hear is silence.</small>
+      </label>
+      <div class="field">
+        <span id="promptLabel">Persona <em>blank resets to the default</em></span>
+        <textarea id="fPrompt" rows="7" spellcheck="false" aria-labelledby="promptLabel"></textarea>
+      </div>
+      <p class="why"><button class="linklike" id="fReset" type="button">restore the built-in defaults</button>
+      — this one only fills the boxes; press Save to keep it.</p>
+    </section>
+
+    <section class="panel" id="p-comfort" data-panel="comfort" hidden>
+      <p class="why">Overrides that live in the page, not only in the OS, because the OS
+      setting is not always reachable from a phone browser — and they persist on this device.</p>
+      <fieldset class="a11y">
+        <legend>Accessibility</legend>
+        <label class="field third">
+          <span>Motion</span>
+          <select id="fMotion">
+            <option value="system">System (prefers-reduced-motion)</option>
+            <option value="reduce">Reduce</option>
+            <option value="no-preference">Full</option>
+          </select>
+        </label>
+        <label class="field third">
+          <span>Contrast</span>
+          <select id="fContrast">
+            <option value="system">System</option>
+            <option value="more">High</option>
+          </select>
+        </label>
+        <label class="field third">
+          <span>Text size</span>
+          <select id="fScale">
+            <option value="1">Default</option>
+            <option value="1.15">Large</option>
+            <option value="1.3">Largest</option>
+          </select>
+        </label>
+        <label class="check">
+          <input id="fCues" type="checkbox" checked />
+          <span>Earcons — 120 ms blips on mic open/close. Kept under 150 ms so they never mask the first phoneme.</span>
+        </label>
+      </fieldset>
+    </section>
+
+    <section class="panel" id="p-quality" data-panel="quality" hidden>
+      <p class="why">Averages hide the calls people remember, so the strip under the thread
+      shows p50 and p95, not a mean. It counts this page load only.</p>
+      <ul class="legend-list">
+        <li><b>turn</b> — silence to first agent audio. What the caller feels. Over ~1200 ms reads as a bad line.</li>
+        <li><b>spread</b> — p50/p95 of the same number. Averages hide the two calls out of twenty that were awful.</li>
+        <li><b>audio</b> — how much the agent actually played.</li>
+        <li><b>calls</b> — sessions started. The free tier counts requests per day.</li>
+        <li><b>tok</b> — Live tokens so far: the closest thing to a bill on a ₹0 stack.</li>
+      </ul>
+      <div class="row">
+        <button class="secondary" id="statsReset" type="button">Reset the counters</button>
+      </div>
+      <p class="why">Measured before and after a change is the only way to know a setting
+      helped. Reset here, change one thing on another tab, then compare.</p>
+    </section>
+
+    <section class="panel" id="p-phone" data-panel="phone" hidden>
+      <p class="why">What this is, said plainly: a browser tab that talks to Google. It is
+      not a phone number, and no ₹0 stack is.</p>
+      <ul class="legend-list">
+        <li>A friend "calls" it when you send the link and they tap the mic — that needs <code>https://</code>, because <code>getUserMedia</code> does.</li>
+        <li>Dialling a real number costs money per minute at every provider, and India adds TRAI/DLT rules for commercial outbound.</li>
+        <li>A real landline answer is possible for ₹0 over Bluetooth HFP with your own Android as the modem — Linux, oFono, no cloud. That is a build, not a setting.</li>
+        <li>Jio Fiber can forward an inbound call to your mobile for free, and the AI can answer it there.</li>
+      </ul>
+      <p class="why">If the mic never arrives, the page tells you why under the composer
+      rather than pretending to listen.</p>
+    </section>
+
     </div>
 
-    <label class="field">
-      <span>Opening line <em>what it says the moment the call connects</em></span>
-      <input id="fGreet" type="text" autocomplete="off" />
-      <small>The Live API waits for your voice after connecting, so without this the first
-      thing you hear is silence. Sent as a system signal, never shown in the transcript.</small>
-    </label>
-
-    <label class="field">
-      <span>Persona <em>blank resets to the default</em></span>
-      <textarea id="fPrompt" rows="7" spellcheck="false"></textarea>
-      <small><button class="linklike" id="fReset" type="button">restore the built-in defaults</button>
-      — this one only fills the boxes; press Save to keep it.</small>
-    </label>
-
-    <p class="keywarn" id="keyWarn">
-      Key lives in <code>localStorage</code> on this device and goes straight to Google.
-      Server-side instead: <code>PROXY=1 GEMINI_API_KEY=… npm i ws &amp;&amp; npm start</code>.
-    </p>
-
     <div class="sheet-actions">
+      <button id="panelPrev" class="ghost" type="button" aria-label="Previous section">◂</button>
+      <button id="panelNext" class="ghost" type="button" aria-label="Next section">▸</button>
+      <span class="grow"></span>
       <button id="sheetSave" class="primary">Save</button>
       <button id="sheetTest" class="ghost">Test connection</button>
       <button id="sheetClose" class="ghost">Close</button>
