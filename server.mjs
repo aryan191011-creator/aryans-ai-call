@@ -101,6 +101,7 @@ if (PROXY) {
       headers: { 'x-goog-api-key': GEMINI_API_KEY },
     });
     const queue = [];
+    let upstreamErr = '';
     upstream.on('open', () => {
       console.log('[relay] upstream open');
       while (queue.length) upstream.send(queue.shift());
@@ -114,12 +115,19 @@ if (PROXY) {
       if (browser.readyState === WebSocket.OPEN) browser.send(msg.toString());
     });
     upstream.on('close', (code, reason) => {
+      // A bare 1006 is useless to whoever is debugging a silent call. The real
+      // cause lives on the error event (DNS/refused/TLS), so carry it across.
+      const detail = String(reason || '') || upstreamErr;
+      console.error('[relay] upstream closed:', code, detail);
       try {
-        browser.send(JSON.stringify({ relayError: { code, reason: String(reason) } }));
+        browser.send(JSON.stringify({ relayError: { code, reason: detail || 'upstream closed' } }));
       } catch {}
       browser.close();
     });
-    upstream.on('error', (e) => console.error('[relay] upstream error:', e.message));
+    upstream.on('error', (e) => {
+      upstreamErr = e.message;
+      console.error('[relay] upstream error:', e.message);
+    });
     browser.on('close', () => upstream.close());
   });
   console.log('[relay] WebSocket proxy mounted at /relay');

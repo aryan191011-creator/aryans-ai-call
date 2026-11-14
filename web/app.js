@@ -52,7 +52,10 @@ const load = () => ({ ...DEFAULTS, ...JSON.parse(localStorage.getItem(LS) || '{}
 const save = (c) => localStorage.setItem(LS, JSON.stringify(c));
 let cfg = load();
 
-const RELAY = location.origin + '/relay';
+// Browsers accept http(s) origins for WebSocket and upgrade them, but say it
+// explicitly — the preview reaches us over an https proxy and a wrong scheme
+// here is a connection that dies before a single audio frame moves.
+const RELAY = location.origin.replace(/^http/, 'ws') + '/relay';
 const DIRECT =
   'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta' +
   '.GenerativeService.BidiGenerateContent';

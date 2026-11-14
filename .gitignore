@@ -1,0 +1,6 @@
+node_modules/
+.env
+*.log
+models/
+web/secrets*
+.DS_Store
