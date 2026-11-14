@@ -153,7 +153,7 @@ check('the page is granted audio and nothing else', () => {
   assert.ok(n >= 2, `expected deny() on both the no-permission and no-audio paths, saw ${n}`);
   const body = java.slice(java.indexOf('public void onPermissionRequest'),
     java.indexOf('});', java.indexOf('public void onPermissionRequest')));
-  assert.match(body, /for \(int r : want\)/, 'resources must be filtered one by one');
+  assert.match(body, /for \(String r : want\)/, 'resources must be filtered one by one');
   assert.ok(!/setAllowUniversalAccessFromFileURLs/.test(java), 'universal file access');
 });
 
@@ -165,6 +165,23 @@ check('the mic is optional at install time', () => {
 });
 
 // ── the WebView settings that decide whether anything works ─────────────────
+check('the permission resources are handled as the Strings they are', () => {
+  // `PermissionRequest.getResources()` returns String[], and RESOURCE_AUDIO_CAPTURE is a String
+  // constant, not an int. Assuming the int shape — which is what the *native* media APIs use —
+  // produces three javac errors in the one method this app exists to write, and no amount of
+  // structural checking shortens that to "read the signature". So the signature is written down
+  // here as an assertion, and the equality is written the way it cannot throw: constant first,
+  // because a null entry in the array is a request that should be refused, not a crash.
+  assert.match(java, /String\[\] want = req\.getResources\(\)/, 'getResources() is String[]');
+  assert.doesNotMatch(java, /int\[\] \w+ = req\.getResources\(\)/, 'int[] from getResources() does not compile');
+  assert.match(java, /String\[\] grant = new String\[n\]/, 'grant() takes String[]');
+  assert.match(java, /PermissionRequest\.RESOURCE_AUDIO_CAPTURE\.equals\(r\)/,
+    'equals on the constant, so a null entry cannot NPE');
+  assert.doesNotMatch(java, /r\.equals\(PermissionRequest\.RESOURCE/, 'null entry would throw');
+  assert.doesNotMatch(java, /RESOURCE_AUDIO_CAPTURE\s*==\s*r|r\s*==\s*PermissionRequest\.RESOURCE/,
+    'reference comparison on Strings');
+});
+
 check('the four settings that silently break this app are set', () => {
   const want = [
     ['setDomStorageEnabled\\(true\\)', 'no localStorage means no saved key, ever'],
@@ -467,7 +484,11 @@ check('the workflow builds, checks, uploads and releases', () => {
   // doesNotMatch on the whole file would fail on a comment about the thing it forbids.
   assert.ok(!existsSync(`${ROOT}${A}/gradle/wrapper/gradle-wrapper.jar`),
     'a wrapper jar here is a binary nobody audits');
-  assert.doesNotMatch(wf, /run:[^\n]*gradlew/, 'the wrapper jar is not in this repo');
+  // Comment-stripped, because a run: | block puts the command on the NEXT line and a
+  // `run:…gradlew` regex would only ever catch the one-line form. Prose that mentions the
+  // wrapper is fine; invoking it is not, since the jar is deliberately absent.
+  const code = wf.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n');
+  assert.doesNotMatch(code, /gradlew/, 'the wrapper jar is not in this repo, so nothing may invoke it');
   assert.match(wf, /setup-android/, 'no SDK, no aapt2');
 });
 

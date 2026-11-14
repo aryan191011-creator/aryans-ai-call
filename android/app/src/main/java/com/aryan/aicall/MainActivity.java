@@ -194,16 +194,26 @@ public final class MainActivity extends Activity {
                     ensureMic();
                     return;
                 }
-                int[] want = req.getResources();
+                // Strings, not ints. getResources() returns String[] and RESOURCE_AUDIO_CAPTURE
+                // is a String constant, so the comparison is by value with the constant on the
+                // left — a null entry in the array is then a request to refuse, not a crash in
+                // the code that was supposed to refuse it. Assuming the int shape that the
+                // native media APIs use cost four build cycles: three to find the manifest
+                // problems in front of it, and one to read this off an annotation.
+                String[] want = req.getResources();
                 int n = 0;
-                for (int r : want) if (r == PermissionRequest.RESOURCE_AUDIO_CAPTURE) n++;
+                for (String r : want) {
+                    if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(r)) n++;
+                }
                 if (n == 0) {
                     req.deny();
                     return;
                 }
-                int[] grant = new int[n];
+                String[] grant = new String[n];
                 int i = 0;
-                for (int r : want) if (r == PermissionRequest.RESOURCE_AUDIO_CAPTURE) grant[i++] = r;
+                for (String r : want) {
+                    if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(r)) grant[i++] = r;
+                }
                 req.grant(grant);
             }
         });
