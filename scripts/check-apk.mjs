@@ -437,13 +437,32 @@ check('the failure channel itself is wired up', () => {
   // instead of five. If it loses its `if: failure()`, or a verification step stops teeing, the
   // channel goes quiet and every future red X is a guess again — so this is worth a check.
   const wf = read(paths.wf);
-  assert.match(wf, /if: failure\(\)/, 'the report step must run on ANY failed step');
+  assert.match(wf, /if: always\(\) && failure\(\)/,
+    'the report step must run on ANY failed step, including one after it');
+  // `failure()` is evaluated at the step's own position. A report placed among the steps it
+  // describes is skipped by the failure it exists to describe — which is how an inspection step
+  // that died on a SIGPIPE reached GitHub with no annotation and no comment at all.
+  const at = (n) => wf.indexOf(n);
+  assert.ok(at('- name: Report the failure') > at('- name: Publish a Release'),
+    'the report must be the last step in the job');
+  assert.ok(at('- name: Report the failure') > at('upload-artifact'),
+    'nothing that can fail may come after the report');
+  // And a truncating pipe inside a pipefail block is a step that fails on success.
+  const insp = /- name: What is actually in the APK[\s\S]*?\n {6}- /.exec(wf);
+  assert.ok(insp, 'the inspection step is gone');
+  if (/set -euo pipefail|set -o pipefail/.test(insp[0])) {
+    assert.doesNotMatch(insp[0], /\|\s*head -\d/,
+      '`| head -N` under pipefail: the writer dies of SIGPIPE and the step fails for no reason');
+  }
   assert.match(wf, /commits\/\$\{\{ github\.sha \}\}\/comments/, 'posted via the API, the one host reachable from here');
   // The token is the whole step: `gh` in a run step has no credentials unless you map one, and
   // on the first run that was forgotten the report step itself went red on the build that most
   // needed it, which is a worse failure than not having the step.
-  const report = /- name: Report the failure[\s\S]*?\n {6}\S/.exec(wf);
-  assert.ok(report, 'the report step is gone');
+  const rstart = wf.indexOf('- name: Report the failure');
+  assert.ok(rstart >= 0, 'the report step is gone');
+  // Sliced to end of file, because it is the LAST step by design — a regex that needs a
+  // following `- name:` line to terminate would report it missing for being where it belongs.
+  const report = wf.slice(rstart);
   assert.match(wf, /GH_TOKEN: \$\{\{ github\.token \}\}/, 'gh has no credentials without this');
   // And an annotation, because it needs nothing: no token, no auth, no host but api.github.com.
   assert.match(wf, /echo "::error[^"]*\$\{one\}"/,
