@@ -59,7 +59,10 @@ jobs:
           echo "ANDROID_HOME=$ANDROID_HOME"
 
       - name: Static APK checks (no compiler here can catch these)
-        run: node scripts/check-apk.mjs
+        # tee, because the reporting step below needs the text of whichever verification failed.
+        run: |
+          set -o pipefail
+          node scripts/check-apk.mjs 2>&1 | tee /tmp/ci.log
 
       - name: Verify the signing key is readable and self-consistent
         # Cheap, and it fails at second 5 instead of minute 6. Also prints the SHA-256 of the
@@ -81,35 +84,31 @@ jobs:
           # Only two things are needed to make a release build reproducible: no daemon left
           # holding state, and no surprise from a Gradle property someone set in their shell.
           GRADLE_OPTS: -Dorg.gradle.daemon=false
-        # `tee` because the next step needs the text. `|| true` so a failed build reaches that
-        # step instead of ending the job at the failing line.
+        # pipefail matters: without it, `gradle … | tee` reports the exit status of tee, and a
+        # red X turns into a green step that produced nothing.
         run: |
           set -o pipefail
           gradle --no-daemon --stacktrace :app:assembleRelease :app:assembleDebug 2>&1 \
-            | tee /tmp/gradle.log || echo "BUILD_FAILED=1" >> "$GITHUB_ENV"
+            | tee -a /tmp/ci.log
 
       - name: Report the failure where it can be read
         # This sandbox cannot download Actions logs at all — the log host is not reachable from
         # it, so `gh run view --log-failed` returns an EOF and a red X tells you nothing about
         # why. Posting the interesting lines as a comment on the commit routes the same
-        # information through api.github.com, which is reachable, and it is where a reader of
-        # the commit would look anyway. Only ever posted on a failure.
-        if: env.BUILD_FAILED == '1'
+        # information through api.github.com, which does answer, and it lands where a reader of
+        # the commit would look anyway. Gated on failure() rather than on the build step's exit
+        # code, because the three failures this has already caught were in the checks and the
+        # manifest, not the compiler.
+        if: failure()
         run: |
-          grep -E -A4 "^\* What went wrong|FAILURE:|error:|Execution failed" /tmp/gradle.log \
-            | tail -100 > /tmp/tail.txt
-          printf '%s\n' "### android build failed on ${{ github.sha }}" > /tmp/body.txt
-          printf '\n```\n' >> /tmp/body.txt
-          tail -60 /tmp/tail.txt >> /tmp/body.txt
-          printf '\n```\n' >> /tmp/body.txt
+          {
+            grep -E -A5 "FAIL |FAILURE:|^\* What went wrong|error:|Execution failed" /tmp/ci.log
+            echo "--- raw tail ---"; tail -20 /tmp/ci.log
+          } > /tmp/why.txt 2>/dev/null || true
+          printf '### android job failed on %s\n\n```\n%s\n```\n' \
+            "${{ github.ref_name }}" "$(head -c 5500 /tmp/why.txt)" > /tmp/body.txt
           gh api -X POST "repos/{owner}/{repo}/commits/${{ github.sha }}/comments" \
             -F body=@/tmp/body.txt
-        env:
-          GH_TOKEN: ${{ github.token }}
-
-      - name: Fail the step if the build did
-        if: env.BUILD_FAILED == '1'
-        run: exit 1
 
       - name: What is actually in the APK
         # Unbundles the release artifact and checks the staged page survived aapt's path

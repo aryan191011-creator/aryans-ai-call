@@ -415,6 +415,19 @@ check('gradle wires staging so no build path can skip it', () => {
   assert.match(app, /file\("\$rootDir\/\.\.\/web"\)/, 'staging must read the real web/');
 });
 
+check('the failure channel itself is wired up', () => {
+  // The reporting step is the only reason the last three failures took one round trip each
+  // instead of five. If it loses its `if: failure()`, or a verification step stops teeing, the
+  // channel goes quiet and every future red X is a guess again — so this is worth a check.
+  const wf = read(paths.wf);
+  assert.match(wf, /if: failure\(\)/, 'the report step must run on ANY failed step');
+  assert.match(wf, /commits\/\$\{\{ github\.sha \}\}\/comments/, 'posted via the API, the one host reachable from here');
+  const teed = [...wf.matchAll(/tee (-a )?\/tmp\/ci\.log/g)];
+  assert.ok(teed.length >= 2, `expected checks + build to tee, saw ${teed.length}`);
+  assert.match(wf, /set -o pipefail/, '`| tee` alone reports tee\'s exit status, not gradle\'s');
+  assert.doesNotMatch(wf, /BUILD_FAILED/, 'a flag nobody sets is a report that never posts');
+});
+
 check('a tag and a versionName agree', () => {
   const code = /versionCode (\d+)/.exec(app)[1];
   const name = /versionName '([\d.]+)'/.exec(app)[1];
