@@ -58,9 +58,15 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   // A request line per hit is the whole point: when someone reports "the
   // preview is dead", this answers the only question that matters — did their
-  // browser ever reach us, or did it die before that?
+  // browser ever reach us, or did it die before that? The UA is logged because
+  // "GET / from curl" and "GET / from a real browser" look identical otherwise,
+  // and only the second one can render a page.
+  const ua = String(req.headers['user-agent'] || 'no-ua').slice(0, 60);
   const seen = () =>
-    console.log(`[http] ${req.method} ${url.pathname} → ${res.statusCode} (${Date.now() - t0}ms up)`);
+    console.log(
+      `[http] ${req.method} ${url.pathname} → ${res.statusCode} ` +
+        `(${Date.now() - t0}ms up) "${ua}"`
+    );
   res.on('finish', seen);
 
   if (url.pathname === '/healthz') {
