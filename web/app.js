@@ -47,6 +47,21 @@ HOW TO RUN THE CALL
   then close politely. Do not argue.
 - To end the call, say one short goodbye line and then use the end_call tool.
 
+VOICE STYLE — how you sound, not what you say
+- Speak, do not read. Contractions always. No lists, no bullet points, no headings, no
+  emojis, no asterisks, nothing that has to be described out loud to be understood.
+- Short sentences, then a real pause. One idea per turn, and end on the question.
+- Never announce what you are about to do ("let me check that for you" twice in a row is
+  stalling). Say the thing, or say nothing and just answer.
+- Read ordinary numbers the way a person says them — "gyaarah sau", not "one one two
+  three". Reference numbers, OTPs and amounts are the exception: digit by digit, as the
+  NUMBERS rule above requires. Those two rules do not conflict; that one is safety.
+- Acknowledge like a human on a phone: "theek hai", "haan", "samajh gaya" — occasionally,
+  not as a verbal crutch on every turn. Mirror the caller's mix: if they go full Hindi,
+  go with them; if they go full English, follow.
+- If you cannot hear them, or the line is bad, say that plainly in one line and ask them
+  to repeat. Never guess an answer off a half-heard number.
+
 TONE
 - Warm, efficient, a little dry. No "Great question!" and no filler like "Absolutely!".
 
@@ -57,10 +72,31 @@ CALL START
   something the caller said: never read it back, never mention it, never repeat it.
 `;
 
+/**
+ * The 30 prebuilt voices, with the character word Google attaches to each. The
+ * <select> in index.html carries the same 30 names and a boot check asserts the two
+ * lists agree — an unrecognised voice name is either ignored in silence or rejects
+ * the whole setup frame, and both look to the user like "the picker does nothing".
+ */
+const VOICES = {
+  Sulafat: 'Warm', Achird: 'Friendly', Charon: 'Informative', Aoede: 'Breezy',
+  Leda: 'Youthful', Kore: 'Firm', Puck: 'Upbeat', Fenrir: 'Excitable', Orus: 'Firm',
+  Zephyr: 'Bright', Autonoe: 'Bright', Enceladus: 'Breathy', Iapetus: 'Clear',
+  Umbriel: 'Easy-going', Algieba: 'Smooth', Despina: 'Smooth', Erinome: 'Clear',
+  Algenib: 'Gravelly', Rasalgethi: 'Informative', Laomedeia: 'Upbeat',
+  Achernar: 'Soft', Alnilam: 'Firm', Schedar: 'Even', Gacrux: 'Mature',
+  Pulcherrima: 'Forward', Zubenelgenubi: 'Casual', Vindemiatrix: 'Gentle',
+  Sadachbia: 'Lively', Sadaltager: 'Knowledgeable', Callirrhoe: 'Easy-going',
+};
+
 const DEFAULTS = {
   key: '',
   model: 'models/gemini-2.5-flash-native-audio-preview-12-2025',
-  voice: 'Kore',
+  // A phone assistant wants to sound like a person who has time for you, not like a
+  // read-aloud engine: Warm over Firm. Anyone can change it, by ear, in Settings.
+  voice: 'Sulafat',
+  tone: 'natural',
+  sample: 'Theek hai, main note kar leta hoon. Aur kuch chahiye aapko?',
   vad: 'server',
   guard: true,
   prompt: DEFAULT_PROMPT,
@@ -189,6 +225,20 @@ function appendTurn(who, text) {
 // avoids the "sampleRate not supported" trap on iOS/Safari.
 const IN_RATE = 16000;
 const OUT_RATE = 24000;
+
+/*
+ * The model's delivery is expressive; laptop and phone speakers are not. A small
+ * fixed chain — tame the 3 kHz sibilance that makes synthetic voices hiss, give back
+ * some body in the low mids, and level the peaks so an excited read never clips — is
+ * most of the difference between "an AI voice" and "a person on the phone". Zero
+ * cost, no network, and switchable off if you would rather hear the raw model.
+ */
+const TONE = {
+  natural: { low: 1.0, pres: -1.0, hi: 0.0, thr: -18, ratio: 3 },
+  warm:    { low: 2.6, pres: -2.2, hi: -2.0, thr: -20, ratio: 3 },
+  clear:   { low: -1.0, pres: 2.4, hi: 1.8, thr: -14, ratio: 4 },
+  off:     null,
+};
 const CHUNK_MS = 100;
 
 let actx = null;
@@ -243,8 +293,7 @@ async function openMic() {
       channelCount: 1,
     },
   });
-  actx = new (window.AudioContext || window.webkitAudioContext)();
-  if (actx.state === 'suspended') await actx.resume();
+  if (!actx) await ensureAudio();
   const src = actx.createMediaStreamSource(stream);
   proc = actx.createScriptProcessor(2048, 1, 1);
   sink = actx.createGain();
@@ -299,6 +348,51 @@ async function openMic() {
   src.connect(proc);
 }
 
+/** Map a getUserMedia rejection to something a person can act on. */
+function micFailure(e) {
+  const inFrame = window.self !== window.top;
+  const name = e?.name || '';
+  if (!window.isSecureContext) {
+    return ['insecure origin', 'getUserMedia only works on https:// or localhost, and this page is served over ' + location.protocol + '. Open it at the Pages URL or the sandbox URL — both are https.'];
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    return [inFrame ? 'blocked by the embedded frame' : 'no microphone API',
+      inFrame
+        ? 'This page is inside a frame whose owner did not set allow="microphone", so the browser refuses before asking you. Open it in its own tab and it will ask normally.'
+        : 'This browser does not expose getUserMedia at all. A recent Chrome, Safari or Firefox will.'];
+  }
+  if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+    return [inFrame ? 'blocked by the embedded frame' : 'permission not granted',
+      inFrame
+        ? 'The embedder has to grant microphone access before the page can ask for it. Open this in its own tab.'
+        : 'You dismissed the prompt, or the site is set to Block. Click the mic icon in the address bar, allow it, then Start again.'];
+  }
+  if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+    return ['no capture device', 'This device has no microphone the browser can see, or it is disabled at the OS level.'];
+  }
+  if (name === 'NotReadableError' || name === 'TrackStartError') {
+    return ['in use by another app', 'A meeting, a recorder, or another tab is holding the microphone. Close it and press Start again.'];
+  }
+  if (name === 'OverconstrainedError') {
+    return ['refused the requested settings', 'The device exists but rejected echo cancellation / mono / gain constraints. Some headsets do this; unplug and retry, or just type.'];
+  }
+  return ['could not open', e?.message || String(e)];
+}
+
+function showMicHelp(e) {
+  const [why, how] = micFailure(e);
+  const strip = $('micHelp');
+  if (strip) {
+    $('micWhy').textContent = `Mic blocked — ${why}.`;
+    $('micHow').textContent = how;
+    $('micOpenTab').href = location.href;
+    strip.hidden = false;
+  }
+  setMode('text in · voice out', 'muted');
+  el.say.textContent = 'Mic blocked — type below, I will answer out loud.';
+  note(`Mic blocked (${why}). No problem: the call still works — write, and listen.`, 'err');
+}
+
 function closeMic() {
   try { proc?.disconnect(); sink?.disconnect(); } catch {}
   stream?.getTracks().forEach((t) => t.stop());
@@ -307,6 +401,142 @@ function closeMic() {
 }
 
 /** Queue a 24 kHz mono PCM buffer; scheduled gaplessly against the audio clock. */
+/*
+ * "Warm", "Firm", "Breezy" are adjectives; two people hear two different voices in
+ * them. One REST call to the TTS row plays the actual voice reading an actual line it
+ * would say on this call — the choice gets made by ear. Free tier, no dependency.
+ * Deliberately no style directive in the text: some TTS rows read an instruction aloud
+ * instead of acting on it, which is worse than sending none.
+ */
+const TTS_MODEL = 'gemini-2.5-flash-preview-tts';
+const TTS_PATH = 'tts';
+const TTS_URL = `https://generativelanguage.googleapis.com/v1beta/models/${TTS_MODEL}:generateContent`;
+
+/** Canonical 44-byte header: the TTS row returns raw 24 kHz signed-16 mono. */
+function pcmToWav(pcm, rate = 24000) {
+  const len = pcm.length;
+  const out = new Uint8Array(44 + len);
+  const dv = new DataView(out.buffer);
+  const ascii = (o, str) => { for (let i = 0; i < str.length; i++) dv.setUint8(o + i, str.charCodeAt(i)); };
+  ascii(0, 'RIFF'); dv.setUint32(4, 36 + len, true); ascii(8, 'WAVE');
+  ascii(12, 'fmt '); dv.setUint32(16, 16, true);
+  dv.setUint16(20, 1, true); dv.setUint16(22, 1, true); // PCM, mono
+  dv.setUint32(24, rate, true); dv.setUint32(28, rate * 2, true);
+  dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+  ascii(36, 'data'); dv.setUint32(40, len, true);
+  out.set(pcm, 44);
+  return out;
+}
+
+const isRiff = (b) => b.length > 4 && b[0] === 82 && b[1] === 73 && b[2] === 70 && b[3] === 70;
+
+function unbase64(str) {
+  const bin = atob(str);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+async function audition() {
+  const btn = $('fAudition');
+  const log = el.sheetLog;
+  const name = $('fVoice').value;
+  const line = (($('fSample').value || '').trim() || cfg.sample || DEFAULTS.sample).slice(0, 240);
+  const body = JSON.stringify({
+    contents: [{ role: 'user', parts: [{ text: line }] }],
+    generationConfig: {
+      responseModalities: ['AUDIO'],
+      // Same nesting as the Live setup frame, for the same reason.
+      speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: name } } },
+    },
+  });
+  // Keysafe mode keeps the key out of browser storage, so the audition goes through the
+  // server too — otherwise voices could only be previewed in the weaker mode. A key
+  // typed into the sheet but not yet saved still works: this is a preview, not a call.
+  const typedKey = ($('fKey').value || '').trim();
+  const key = cfg.key || typedKey;
+  const viaServer = cfg.keysafe;
+  if (!viaServer && !key) {
+    if (log) log.textContent = 'Paste a key above first — it is needed to render a sample.';
+    return;
+  }
+  const url = viaServer ? `${location.origin}/${TTS_PATH}` : TTS_URL;
+  const headers = { 'content-type': 'application/json' };
+  if (!viaServer) headers['x-goog-api-key'] = key;
+
+  btn.disabled = true;
+  if (log) { log.hidden = false; log.textContent = `rendering "${name}" on ${TTS_MODEL}…`; }
+  try {
+    await ensureAudio();
+    const r = await fetch(url, { method: 'POST', headers, body });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j?.error?.message || `HTTP ${r.status}`);
+    const part = (j?.candidates?.[0]?.content?.parts || []).find((x) => x?.inlineData?.data);
+    if (!part) throw new Error('no audio in the response — the model or voice name may be off');
+    const raw = unbase64(part.inlineData.data);
+    const wav = isRiff(raw) ? raw : pcmToWav(raw, 24000);
+    if (log) log.textContent = `${name} · ${VOICES[name] || '—'} · ${(wav.length / 1024) | 0} kB — plays through your Voice feel chain`;
+    if (actx?.decodeAudioData) {
+      const buf = await actx.decodeAudioData(wav.buffer.slice(0));
+      const src = actx.createBufferSource();
+      src.buffer = buf;
+      src.connect(el.outGain);
+      src.start();
+    } else if (typeof URL !== 'undefined' && URL.createObjectURL && typeof Blob !== 'undefined') {
+      new window.Audio(URL.createObjectURL(new Blob([wav], { type: 'audio/wav' }))).play().catch(() => {});
+    }
+  } catch (e) {
+    // Never throw the user into a dead button: say what failed and why.
+    if (log) log.textContent = `Audition failed: ${e.message}`;
+    note(`Audition failed: ${e.message}`, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/** Wire outGain -> [tone chain] -> destination. outGain stays the duck point. */
+function buildOutput() {
+  const trim = actx.createGain();
+  trim.gain.value = 1;
+  let tail = trim;
+  const t = TONE[cfg.tone] ?? TONE.natural;
+  if (t && actx.createBiquadFilter) {
+    const low = actx.createBiquadFilter();
+    low.type = 'lowshelf'; low.frequency.value = 180; low.gain.value = t.low;
+    const pres = actx.createBiquadFilter();
+    pres.type = 'peaking'; pres.frequency.value = 3200; pres.Q.value = 0.8; pres.gain.value = t.pres;
+    const hi = actx.createBiquadFilter();
+    hi.type = 'highshelf'; hi.frequency.value = 7000; hi.gain.value = t.hi;
+    const comp = actx.createDynamicsCompressor ? actx.createDynamicsCompressor() : null;
+    trim.connect(low); low.connect(pres); pres.connect(hi);
+    tail = hi;
+    if (comp) {
+      comp.threshold.value = t.thr; comp.ratio.value = t.ratio;
+      comp.attack.value = 0.003; comp.release.value = 0.12;
+      hi.connect(comp); tail = comp;
+    }
+  }
+  tail.connect(actx.destination);
+  el.outGain = trim;
+}
+
+/**
+ * Created on the tap that started the call, never after an await: build the context
+ * *after* `await getUserMedia()` and the gesture has already expired — on iOS/Safari
+ * that leaves a permanently suspended context, which is silent audio with no error and
+ * nothing in the console. So this is called first, synchronously, from connect().
+ */
+async function ensureAudio() {
+  if (!actx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return false;
+    actx = new AC();
+  }
+  if (actx.state === 'suspended') { try { await actx.resume(); } catch {} }
+  if (!el.outGain) buildOutput();
+  return Boolean(actx);
+}
+
 function playPcm(int16) {
   const f = new Float32Array(int16.length);
   for (let i = 0; i < int16.length; i++) f[i] = int16[i] / (int16[i] < 0 ? 0x8000 : 0x7fff);
@@ -346,6 +576,7 @@ let ws = null;
 let agentSpeaking = false;
 let muted = false;
 let kickedOff = false;
+let micBlocked = false;
 let settled = false; // setupComplete seen
 let triedMinimal = false;
 let tools = {};
@@ -361,7 +592,11 @@ function setAgentSpeaking(on) {
     endThinking();
   } else {
     abubble?.classList.remove('pending');
-    setMode(muted ? 'muted' : 'listening', muted ? 'muted' : 'listening');
+    // 'muted' covers both cases where nothing is being captured: you muted it, and
+    // the browser refused the microphone. Either way, claiming 'listening' would be
+    // the one thing a voice UI must never do — show a state that is not happening.
+    setMode(micBlocked ? 'text in · voice out' : muted ? 'muted' : 'listening',
+      micBlocked || muted ? 'muted' : 'listening');
     el.say.innerHTML = muted
       ? 'Mic muted — tap <b>Unmute</b> to interrupt again.'
       : 'Boliye — <b>main sun raha hoon</b>.';
@@ -452,10 +687,16 @@ function sendAudio(int16) {
 
 function fullSetup() {
   const setup = {
-    model: cfg.model,
-    responseModalities: ['AUDIO'],
-    systemInstruction: { parts: [{ text: cfg.prompt }] },
-    speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: cfg.voice } } },
+      model: cfg.model,
+      // These live under setup.generationConfig, not on setup itself — the Live API
+      // reference is explicit. Sent flat, `speechConfig` is an unknown field: the call
+      // still works, the model speaks, and the voice you picked is silently dropped.
+      // That is the worst possible failure, because it looks like it is applying.
+      generationConfig: {
+        responseModalities: ['AUDIO'],
+        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: cfg.voice } } },
+      },
+      systemInstruction: { parts: [{ text: cfg.prompt }] },
     inputAudioTranscription: {},
     outputAudioTranscription: {},
     // Advertising the tools is what makes them callable. Declaring the handler
@@ -511,15 +752,19 @@ async function connect() {
     note('Gemini API key chahiye pehle — free hai, card nahi.', 'err');
     return;
   }
+  await ensureAudio();
+  micBlocked = false;
   try {
     await openMic();
   } catch (e) {
-    note(`Mic blocked: ${e.message}. Chrome needs https:// or localhost for getUserMedia.`, 'err');
-    return;
+    // A blocked microphone used to end the attempt here. That was wrong: nothing about
+    // *hearing* the agent needs a mic, and "your browser will not give me audio input"
+    // is a normal state on an embedded preview, a locked-down work laptop, or a phone
+    // with the mic switch on mute. So say exactly why, offer the way out, and carry on
+    // as voice-out / text-in instead of failing the call.
+    micBlocked = true;
+    showMicHelp(e);
   }
-  el.outGain = actx.createGain();
-  el.outGain.gain.value = 1;
-  el.outGain.connect(actx.destination);
 
   setMode('connecting', 'connecting');
   el.say.textContent = 'Connecting…';
@@ -546,11 +791,18 @@ function onMessage(ev) {
     settled = true;
     stats.calls++;
     el.sCalls.textContent = stats.calls;
-    setMode('listening', 'listening');
-    el.say.textContent = 'Boliye — main sun raha hoon.';
     el.hangup.hidden = false;
-    el.muteBtn.hidden = false;
-    el.ptt.hidden = cfg.vad === 'ptt';
+    // A session with no microphone is not "listening" — claiming it would be the one
+    // thing a voice UI must never do, showing a state that is not happening.
+    el.muteBtn.hidden = micBlocked;
+    el.ptt.hidden = cfg.vad === 'ptt' || micBlocked;
+    if (!micBlocked) {
+      setMode('listening', 'listening');
+      el.say.textContent = 'Boliye — main sun raha hoon.';
+    } else {
+      setMode('text in · voice out', 'muted');
+      el.say.textContent = 'Type below — I will answer out loud.';
+    }
     blip('open');
     if (cfg.vad === 'ptt') el.say.textContent = 'Hold the button and talk.';
     // Ask for the opening turn. The caller should not have to speak first just to
@@ -689,7 +941,8 @@ async function handleToolCall(call) {
 }
 
 function teardown() {
-  kickedOff = false; // a new call earns a new greeting
+  kickedOff = false;
+  micBlocked = false; // a new call earns a new greeting
   flushPlayback();
   closeMic();
   try { ws?.close(); } catch {}
@@ -714,10 +967,13 @@ function teardown() {
   stats.turnStart = 0;
   stats.speech = false;
   stats.since = 0;
+  const help = $('micHelp');
+  if (help) help.hidden = true;
   stats.lastFlush = 0;
   duckUntil = 0;
   clearTimeout(thinkTimer);
   if (el.lat) el.lat.hidden = true;
+  el.outGain = null; // the context outlives the graph; rebuild the chain next call
 }
 
 async function start() {
@@ -854,6 +1110,9 @@ const openSheet = () => {
   $('fVoice').value = cfg.voice;
   $('fVad').value = cfg.vad;
   $('fGuard').checked = cfg.guard;
+  $('fTone').value = cfg.tone;
+  $('fSample').value = cfg.sample;
+  $('voiceHint').textContent = `${cfg.voice} · ${VOICES[cfg.voice] || '—'}`;
   $('fPrompt').value = cfg.prompt;
   $('fGreet').value = cfg.greeting;
   $('fMotion').value = a11y.motion;
@@ -878,6 +1137,19 @@ $('sheetClose').addEventListener('click', closeSheet);
 el.sheet.addEventListener('click', (e) => {
   if (e.target === el.sheet) closeSheet();
 });
+$('fVoice').addEventListener('change', () => {
+  const n = $('fVoice').value;
+  $('voiceHint').textContent = `${n} · ${VOICES[n] || 'unknown to this build'}`;
+});
+$('fAudition').addEventListener('click', () => audition());
+// The defaults improve; a copy saved last month does not. One click back, without
+// touching storage — saving stays an explicit act.
+$('fReset').addEventListener('click', () => {
+  $('fPrompt').value = DEFAULT_PROMPT;
+  $('fGreet').value = DEFAULT_GREETING;
+  $('fSample').value = DEFAULTS.sample;
+  note('Defaults restored in the form. Save to keep them.', 'sys');
+});
 $('sheetSave').addEventListener('click', () => {
   cfg = load();
   cfg = {
@@ -885,6 +1157,8 @@ $('sheetSave').addEventListener('click', () => {
     key: $('fKey').value.trim(),
     model: $('fModel').value.trim(),
     voice: $('fVoice').value,
+    tone: $('fTone').value,
+    sample: $('fSample').value.trim() || DEFAULTS.sample,
     vad: $('fVad').value,
     guard: $('fGuard').checked,
     // Blank resets rather than persists: an empty persona silently removes every
@@ -900,6 +1174,9 @@ $('sheetSave').addEventListener('click', () => {
   });
   applyA11y();
   save(cfg);
+  // Tone is live: rebuilding the output graph applies it to the rest of this call
+  // instead of making the user hang up to hear whether it helped.
+  if (actx) { el.outGain = null; buildOutput(); }
   closeSheet();
   note('Saved. Restart the session to apply.', 'sys');
   if (ws) { teardown(); note('Session restarted with the new settings — tap the mic again.', 'sys'); }

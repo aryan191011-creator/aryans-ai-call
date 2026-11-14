@@ -19,6 +19,9 @@ import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+const TTS_UPSTREAM =
+  'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent';
+
 const ROOT = fileURLToPath(new URL('./web', import.meta.url));
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -78,6 +81,47 @@ const server = http.createServer(async (req, res) => {
     // Tells the page whether it may talk to Google directly or must use us.
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ keysafe: PROXY && Boolean(GEMINI_API_KEY) }));
+    return;
+  }
+
+  if (url.pathname === '/tts') {
+    // Voice audition for the settings sheet. Only exists in keysafe mode, where the
+    // browser has no key of its own: without this the picker would only be able to
+    // preview voices in the weaker, key-in-the-browser mode.
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'content-type': 'application/json' }).end(JSON.stringify({ error: { message: 'POST only' } }));
+      return;
+    }
+    if (!PROXY || !GEMINI_API_KEY) {
+      res.writeHead(409, { 'content-type': 'application/json' }).end(
+        JSON.stringify({ error: { message: 'server is not in keysafe mode — the page should call Google directly' } })
+      );
+      return;
+    }
+    const chunks = [];
+    let size = 0;
+    for await (const c of req) {
+      size += c.length;
+      if (size > 64 * 1024) { res.writeHead(413).end('too big'); return; }  // a prompt, not a payload
+      chunks.push(c);
+    }
+    try {
+      const up = await fetch(TTS_UPSTREAM, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+        body: Buffer.concat(chunks),
+      });
+      const text = await up.text();
+      res.writeHead(up.status, { 'content-type': up.headers.get('content-type') || 'application/json' });
+      res.end(text);
+    } catch (e) {
+      // Never a bare 500: the sheet shows this string, and "fetch failed" tells the
+      // user nothing while "no egress to generativelanguage.googleapis.com" tells
+      // them the sandbox/host is the problem, not their key.
+      res.writeHead(502, { 'content-type': 'application/json' }).end(
+        JSON.stringify({ error: { message: `upstream ${e.message}` } })
+      );
+    }
     return;
   }
 

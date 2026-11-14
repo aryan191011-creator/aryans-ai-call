@@ -75,15 +75,42 @@ const localStorage = {
 };
 
 // ── stub WebAudio (48 kHz context, buffers declared at 24 kHz) ─────────────
-const node = () => ({
-  connect(n) { return n ?? this; },
-  disconnect() {},
-});
+// The graph itself is asserted, not just "no exception was thrown": a tone chain that
+// is built but never reaches the destination is exactly as silent as no chain at all,
+// and an over-forgiving stub is what let that pass before.
+const audio = { nodes: [], edges: [] };
+const node = (kind) => {
+  const n = {
+    _kind: kind,
+    connect(t) { audio.edges.push([n, t]); return t ?? n; },
+    disconnect() {},
+  };
+  audio.nodes.push(n);
+  return n;
+};
 class FakeAudioContext {
-  constructor() { this.sampleRate = 48000; this.currentTime = 0; this.state = 'running'; }
+  constructor() {
+    this.sampleRate = 48000; this.currentTime = 0; this.state = 'running';
+    this.destination = node('destination');
+  }
   async resume() {}
   async close() {}
-  createGain() { return { ...node(), gain: { value: 1 } }; }
+  createGain() { const n = node('gain'); n.gain = { value: 1 }; return n; }
+  createBiquadFilter() {
+    const n = node('biquad');
+    n.type = 'lowpass';
+    n.frequency = { value: 0 }; n.Q = { value: 1 }; n.gain = { value: 0 };
+    return n;
+  }
+  createDynamicsCompressor() {
+    const n = node('compressor');
+    for (const k of ['threshold', 'knee', 'ratio', 'attack', 'release']) n[k] = { value: 0 };
+    return n;
+  }
+  async decodeAudioData(buf) {
+    audio.decoded = new Uint8Array(buf);
+    return { duration: 1.2, length: buf.byteLength };
+  }
   createMediaStreamSource() { return node(); }
   createScriptProcessor() {
     const n = { ...node(), onaudioprocess: null };
@@ -93,7 +120,12 @@ class FakeAudioContext {
   createBuffer(_ch, len, rate) {
     return { length: len, sampleRate: rate, duration: len / rate, copyToChannel() {} };
   }
-  createBufferSource() { return { ...node(), start() {}, stop() {}, buffer: null, onended: null }; }
+  createBufferSource() {
+    const n = node('buffersource');
+    n.start = () => { audio.played = (audio.played || 0) + 1; };
+    n.stop = () => {}; n.buffer = null; n.onended = null;
+    return n;
+  }
   createOscillator() { return { ...node(), frequency: { setValueAtTime() {}, exponentialRampToValueAtTime() {} }, start() {}, stop() {} }; }
 }
 
@@ -121,8 +153,21 @@ class FakeWebSocket {
   from(msg) { this.onmessage?.({ data: JSON.stringify(msg) }); }
 }
 const fetches = [];
-const fetch = async (u) => {
-  fetches.push(u);
+const fetch = async (u, o) => {
+  fetches.push({ url: String(u), opts: o || {} });
+  if (fetches.at(-1).url.includes('generateContent')) {
+    // One second of raw 24 kHz signed-16 mono — deliberately *not* RIFF, so the
+    // client's WAV framing has to run for the sample to be playable at all.
+    const pcm = Buffer.alloc(24000 * 2, 7);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        candidates: [{ content: { parts: [{ inlineData: {
+          mimeType: 'audio/pcm;rate=24000', data: pcm.toString('base64') } }] } }],
+      }),
+    };
+  }
   return { ok: true, status: 200, json: async () => ({ keysafe: false }) };
 };
 
@@ -197,9 +242,20 @@ check('first frame is a setup with model, AUDIO modality and tools', () => {
   const setup = ws.frames('setup')[0];
   assert.ok(setup, 'no setup frame sent');
   assert.equal(setup.setup.model, 'models/gemini-2.5-flash-native-audio-preview-12-2025');
-  assert.deepEqual(setup.setup.responseModalities, ['AUDIO']);
+  // This check used to assert the *wrong* shape — responseModalities and speechConfig
+  // flat on `setup`, mirroring a doc snippet. A test that pins a bug in place is worse
+  // than no test: it makes the bug look sanctioned. It is now asserting the path the
+  // API reference documents, and forbids the old one.
+  const gc = setup.setup.generationConfig;
+  assert.ok(gc, 'no setup.generationConfig — modality and voice belong under it');
+  assert.deepEqual(gc.responseModalities, ['AUDIO']);
+  assert.equal(
+    gc.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName, 'Sulafat',
+    'the voice picked in Settings must reach the wire'
+  );
+  assert.equal(setup.setup.speechConfig, undefined,
+    'speechConfig on setup itself is an unknown field — the API ignores it and you get the default voice');
   assert.ok(setup.setup.tools?.[0]?.functionDeclarations?.length >= 2, 'tools not advertised');
-  assert.equal(setup.setup.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName, 'Kore');
 });
 
 // handshake
@@ -571,6 +627,182 @@ check('the dialog opens and closes through the backdrop, the button and Esc', ()
   esc();
   reg.get('sheet').fire('click', { target: sheet });
   assert.equal(sheet.hidden, true, 'dialog must end up closed, whatever order the taps came in');
+});
+
+// ── voice, tone and the audition path ───────────────────────────────────────
+check('the voice rules are instructions the model can act on', () => {
+  // Everything else in this file is wire or DOM. This one is the part that decides
+  // whether it *sounds* good: the persona must forbid written-form output, and must
+  // not contradict the digit-by-digit read-back rule that keeps numbers safe.
+  const style = /VOICE STYLE([\s\S]*?)\nTONE/.exec(app);
+  assert.ok(style, 'no VOICE STYLE block in the persona');
+  assert.match(style[1], /[Cc]ontractions/);
+  assert.match(style[1], /no lists|No lists/);
+  assert.match(style[1], /one idea per turn/i);
+  assert.match(style[1], /half-heard|never guess/i, 'no rule about a bad line');
+  assert.match(style[1], /exception/i, 'number rules must resolve, not collide');
+  assert.match(app, /echo them back digit by digit/, 'the read-back rule it defers to is gone');
+});
+check('all 30 prebuilt voices are offered, and the picker and the table agree', () => {
+  const sel = /<select id="fVoice">([\s\S]*?)<\/select>/.exec(html);
+  assert.ok(sel, 'no #fVoice select');
+  const names = [...sel[1].matchAll(/<option value="([A-Za-z]+)"/g)].map((m) => m[1]);
+  assert.equal(names.length, 30, 'expected 30 voices, got ' + names.length);
+  const tbl = /const VOICES = \{([\s\S]*?)\n\};/.exec(app);
+  assert.ok(tbl, 'VOICES table not found');
+  const keys = [...tbl[1].matchAll(/([A-Za-z]+):\s*'[^']+'/g)].map((m) => m[1]);
+  assert.equal(keys.length, 30, 'VOICES table has ' + keys.length + ' entries');
+  // A name the API does not know is dropped in silence (or rejects setup), which is
+  // indistinguishable from "the picker is broken" — so neither list may drift.
+  assert.deepEqual(names.filter((n2) => !keys.includes(n2)), [], 'picker offers an unknown voice');
+  assert.deepEqual(keys.filter((n2) => !names.includes(n2)), [], 'table lists a voice the picker hides');
+  const def = /voice: '([A-Za-z]+)'/.exec(app)[1];
+  assert.ok(keys.includes(def), 'default voice ' + def + ' is not a real one');
+});
+
+reg.get('fTone').value = 'warm';
+reg.get('fVoice').value = 'Achird';
+reg.get('fSample').value = 'Haan ji, bol na — kya chal raha hai?';
+reg.get('sheetSave').fire('click');
+await tick();
+
+check('the chosen tone reaches the real audio graph', () => {
+  // Not "a select exists with a warm option" — the filter nodes must carry the warm
+  // numbers, or the setting is another decorative control.
+  const low = audio.nodes.filter((n) => n._kind === 'biquad' && n.type === 'lowshelf' && n.gain.value === 2.6);
+  assert.ok(low.length, 'no low-shelf at +2.6 dB: the Warm setting never reached WebAudio');
+  const hiss = audio.nodes.filter((n) => n._kind === 'biquad' && n.type === 'peaking' && n.frequency.value === 3200);
+  assert.ok(hiss.length, 'no 3.2 kHz de-essing band — the frequency that makes TTS harsh');
+  assert.ok(audio.nodes.some((n) => n._kind === 'compressor'), 'no compressor: loud turns will clip on a phone');
+});
+
+check('the tone chain actually terminates at the speakers', () => {
+  const reaches = (from, to) => audio.edges.some(([a, b]) => a?._kind === from && b?._kind === to);
+  assert.ok(reaches('compressor', 'destination'), 'chain does not reach destination — silent audio');
+  assert.ok(reaches('gain', 'biquad'), 'outGain does not feed the chain, so ducking bypasses tone');
+  assert.ok(reaches('buffersource', 'gain'), 'playback is not routed through outGain');
+});
+
+const ttsFetchIndex = fetches.length;
+reg.get('fAudition').fire('click');
+await tick(12);
+
+check('the audition asks Google for the voice that is selected', () => {
+  const call = fetches[ttsFetchIndex];
+  assert.ok(call, 'no request was made when Hear this voice was clicked');
+  assert.match(call.url, /models\/gemini-2\.5-flash-preview-tts:generateContent$/);
+  assert.equal(call.opts.method, 'POST');
+  assert.equal(call.opts.headers['x-goog-api-key'], 'TESTKEY-abc');
+  const body = JSON.parse(call.opts.body);
+  // The same nesting lesson as the setup frame: voiceName anywhere else is ignored.
+  assert.equal(
+    body.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName, 'Achird',
+    'the audition must render the voice on screen, not the default one'
+  );
+  assert.deepEqual(body.generationConfig.responseModalities, ['AUDIO']);
+  assert.equal(body.contents[0].parts[0].text, 'Haan ji, bol na — kya chal raha hai?');
+  // No style directive smuggled into the text: some rows read it aloud.
+  assert.doesNotMatch(body.contents[0].parts[0].text, /say in a|warm tone|read this/i);
+});
+
+check('raw PCM becomes a playable WAV, byte-exact', () => {
+  const w = audio.decoded;
+  assert.ok(w, 'nothing was decoded — the sample never reached the player');
+  const dv = new DataView(w.buffer, w.byteOffset, w.byteLength);
+  const ascii = (o) => String.fromCharCode(...w.subarray(o, o + 4));
+  assert.equal(ascii(0), 'RIFF');
+  assert.equal(ascii(8), 'WAVE');
+  assert.equal(ascii(12), 'fmt ');
+  assert.equal(dv.getUint16(20, true), 1, 'format must be PCM');
+  assert.equal(dv.getUint16(22, true), 1, 'must be mono');
+  assert.equal(dv.getUint32(24, true), 24000, 'the TTS row returns 24 kHz; anything else is chipmunk or slowed');
+  assert.equal(dv.getUint16(34, true), 16, 'signed 16-bit');
+  assert.equal(ascii(36), 'data');
+  assert.equal(dv.getUint32(40, true), w.length - 44, 'data chunk size disagrees with the payload');
+  assert.equal(dv.getUint32(4, true), 36 + w.length - 44, 'RIFF size disagrees');
+});
+
+check('the audition plays through the tone chain, not around it', () => {
+  assert.ok(audio.played >= 1, 'no buffer source was started');
+  assert.equal(reg.get('sheetLog').hidden, false, 'the sheet should report what it rendered');
+  assert.match(reg.get('sheetLog').textContent, /Achird · Friendly/);
+});
+
+check('the keysafe route for auditions exists on both sides', () => {
+  // A relative path in the client and a route in the server must agree, or preview
+  // only works in the mode where the key sits in browser storage.
+  const path = /const TTS_PATH = '([^']+)'/.exec(app);
+  assert.ok(path, 'client TTS_PATH not found');
+  const srv = fs.readFileSync(fileURLToPath(new URL('../server.mjs', import.meta.url)), 'utf8');
+  assert.ok(srv.includes(`url.pathname === '/${path[1]}'`), `server has no /${path[1]} route`);
+  assert.match(srv, /x-goog-api-key/, 'server must send the key upstream, not the browser');
+});
+
+// ── the microphone must never be able to cancel a call ──────────────────────
+if (reg.get('hangup').hidden === false) { reg.get('hangup').fire('click'); await tick(); }
+const socketsBefore = sockets.length;
+sandbox.navigator.mediaDevices.getUserMedia = async () => {
+  throw Object.assign(new Error('Permission denied'), { name: 'NotAllowedError' });
+};
+reg.get('pttBtn').fire('click');
+await tick();
+
+check('a refused microphone still opens a working call', () => {
+  assert.equal(sockets.length, socketsBefore + 1, 'no session was opened — the mic blocked the whole call');
+  const ws = sockets.at(-1);
+  ws.from({ setupComplete: {} });
+  assert.equal(ws.frames('clientContent').length, 1, 'no greeting without a mic? The caller should still be greeted');
+  // 'thinking' is the honest label while the greeting is being generated; the resting
+  // state after the turn is the one that must not lie about a missing microphone.
+  assert.equal(reg.get('modePill').textContent, 'thinking');
+  ws.from({ serverContent: { modelTurn: { parts: [{ text: 'hi' }] }, turnComplete: true } });
+  assert.equal(reg.get('modePill').textContent, 'text in · voice out',
+    'a session with no microphone must not go back to claiming it is listening');
+  assert.equal(reg.get('muteBtn').hidden, true, 'a mute control for a mic we never got is a lie');
+  assert.equal(reg.get('pushToTalk').hidden, true, 'push-to-talk with no microphone is a dead button');
+  assert.equal(reg.get('micHelp').hidden, false, 'the reason must be on screen, not in the console');
+});
+
+check('the mic error says which of the four causes it is', () => {
+  const why = reg.get('micWhy').textContent;
+  assert.match(why, /permission not granted/i, 'got: ' + why);
+  const how = reg.get('micHow').textContent;
+  assert.match(how, /address bar|allow it/i, 'no actionable next step: ' + how);
+  assert.equal(reg.get('micOpenTab').href, 'http://localhost:8787/', 'the escape hatch must point at this same page, top level');
+});
+
+check('the AudioContext is created before any await, on the tap', () => {
+  // iOS/Safari will not resume a context built after the gesture has expired, and it
+  // fails silently: no audio, no error. So the ordering is a correctness property.
+  const body = /async function connect\(\) \{([\s\S]*?)\n\}/.exec(app)[1];
+  const firstAwait = body.search(/await /);
+  assert.ok(firstAwait >= 0, 'connect() has no awaits — check this test');
+  assert.ok(body.indexOf('await ensureAudio()') >= 0, 'connect() must await ensureAudio() explicitly');
+  assert.ok(body.indexOf('await ensureAudio()') < firstAwait + 'await '.length + 20,
+    'ensureAudio is not the first await in connect()');
+  assert.ok(body.indexOf('openMic') > body.indexOf('ensureAudio'),
+    'the mic is opened before the context exists, which leaks a suspended context');
+});
+
+// ── markup: the class of bug hand-editing HTML keeps producing ───────────────
+check('index.html nests cleanly', () => {
+  const VOID = new Set(['area','base','br','col','embed','hr','img','input','link','meta','source','track','wbr']);
+  const stack = [];
+  const errs = [];
+  for (const m of html.matchAll(/<(\/?)([a-zA-Z][\w-]*)([^>]*?)(\/?)>/g)) {
+    const [, close, rawTag, attrs, selfClose] = m;
+    const tag = rawTag.toLowerCase();
+    if (selfClose || VOID.has(tag)) continue;
+    const line = html.slice(0, m.index).split('\n').length;
+    if (!close) stack.push([tag, line]);
+    else if (!stack.length) errs.push(`line ${line}: </${tag}> with nothing open`);
+    else if (stack.at(-1)[0] !== tag) {
+      errs.push(`line ${line}: </${tag}> closes <${stack.at(-1)[0]}> from line ${stack.at(-1)[1]}`);
+      stack.pop();
+    } else stack.pop();
+  }
+  if (stack.length) errs.push('unclosed: ' + stack.map(([t, l]) => `<${t}>@${l}`).join(', '));
+  assert.deepEqual(errs, [], errs.join(' | '));
 });
 
 for (const [s, n] of results) console.log(s, n);

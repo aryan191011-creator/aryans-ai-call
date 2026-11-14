@@ -116,6 +116,14 @@
     </button>
   </div>
 
+  <div class="note warn" id="micHelp" hidden>
+    <b id="micWhy">Mic blocked.</b>
+    <span id="micHow">A browser only hands over a microphone on <code>https://</code> or
+    <code>localhost</code>, and an embedded preview needs the parent frame to allow it.</span>
+    <a id="micOpenTab" href="#" target="_blank" rel="noopener">Open in a new tab →</a>
+    <span class="dim">The call still works without a mic: type, and it answers out loud.</span>
+  </div>
+
   <p class="hint" id="hint">
     <button class="linklike" id="bargeInfo" aria-expanded="false" aria-controls="bargeHelp">How interruption works</button>
   </p>
@@ -149,12 +157,41 @@
 
     <div class="row">
       <label class="field half">
-        <span>Voice</span>
+        <span>Voice <em>all 30, by ear</em></span>
         <select id="fVoice">
-          <option>Kore</option><option>Puck</option><option>Charon</option>
-          <option>Fenrir</option><option>Aoede</option><option>Orus</option>
-          <option>Zephyr</option><option>Autonoe</option>
+          <option value="Sulafat" selected>Sulafat · Warm · F</option>
+          <option value="Achird">Achird · Friendly · M</option>
+          <option value="Charon">Charon · Informative · M</option>
+          <option value="Aoede">Aoede · Breezy · F</option>
+          <option value="Leda">Leda · Youthful · F</option>
+          <option value="Kore">Kore · Firm · F</option>
+          <option value="Puck">Puck · Upbeat · M</option>
+          <option value="Fenrir">Fenrir · Excitable · M</option>
+          <option value="Orus">Orus · Firm · M</option>
+          <option value="Zephyr">Zephyr · Bright · F</option>
+          <option value="Autonoe">Autonoe · Bright · F</option>
+          <option value="Enceladus">Enceladus · Breathy · M</option>
+          <option value="Iapetus">Iapetus · Clear · M</option>
+          <option value="Umbriel">Umbriel · Easy-going · M</option>
+          <option value="Algieba">Algieba · Smooth · M</option>
+          <option value="Despina">Despina · Smooth · F</option>
+          <option value="Erinome">Erinome · Clear · F</option>
+          <option value="Algenib">Algenib · Gravelly · M</option>
+          <option value="Rasalgethi">Rasalgethi · Informative · M</option>
+          <option value="Laomedeia">Laomedeia · Upbeat · F</option>
+          <option value="Achernar">Achernar · Soft · F</option>
+          <option value="Alnilam">Alnilam · Firm · M</option>
+          <option value="Schedar">Schedar · Even · M</option>
+          <option value="Gacrux">Gacrux · Mature · F</option>
+          <option value="Pulcherrima">Pulcherrima · Forward · F</option>
+          <option value="Zubenelgenubi">Zubenelgenubi · Casual · M</option>
+          <option value="Vindemiatrix">Vindemiatrix · Gentle · F</option>
+          <option value="Sadachbia">Sadachbia · Lively · M</option>
+          <option value="Sadaltager">Sadaltager · Knowledgeable · M</option>
+          <option value="Callirrhoe">Callirrhoe · Easy-going · F</option>
         </select>
+        <small id="voiceHint">Sulafat · Warm — a soft, unhurried read. The default for a phone
+        assistant; Kore and Charon are firmer if you want authority.</small>
       </label>
       <label class="field half">
         <span>Turn detection</span>
@@ -202,6 +239,26 @@
       </label>
     </fieldset>
 
+    <div class="row">
+      <label class="field half">
+        <span>Voice feel <em>applied to what you hear</em></span>
+        <select id="fTone">
+          <option value="natural" selected>Natural — light polish</option>
+          <option value="warm">Warm — fuller, softer sibilance</option>
+          <option value="clear">Clear — phone-speaker friendly</option>
+          <option value="off">Off — raw model audio</option>
+        </select>
+        <small>A gentle EQ and compressor on the output. Zero cost, no network. Try
+        <b>Warm</b> on laptop speakers, <b>Clear</b> on a phone.</small>
+      </label>
+      <label class="field half">
+        <span>Audition line <em>hear a voice before you commit</em></span>
+        <input id="fSample" type="text" autocomplete="off"
+               value="Theek hai, main note kar leta hoon. Aur kuch chahiye aapko?" />
+        <button class="secondary" id="fAudition" type="button">▶ Hear this voice</button>
+      </label>
+    </div>
+
     <label class="field">
       <span>Opening line <em>what it says the moment the call connects</em></span>
       <input id="fGreet" type="text" autocomplete="off" />
@@ -212,6 +269,8 @@
     <label class="field">
       <span>Persona <em>blank resets to the default</em></span>
       <textarea id="fPrompt" rows="7" spellcheck="false"></textarea>
+      <small><button class="linklike" id="fReset" type="button">restore the built-in defaults</button>
+      — this one only fills the boxes; press Save to keep it.</small>
     </label>
 
     <p class="keywarn" id="keyWarn">

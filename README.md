@@ -87,6 +87,39 @@ Design decisions worth defending:
   the harness has no real DOM, which is exactly the difference between "renders in
   Chrome" and "crashes on a phone with no oscillator".
 
+## The voice, and the microphone
+
+**The voice you pick is the voice you get.** `setup.generationConfig.speechConfig.
+voiceConfig.prebuiltVoiceConfig.voiceName` is where the Live API reads it. Sent flat on
+`setup` instead — as a widely-copied snippet does — it is an unknown field: the call
+works, the model speaks, and your choice is dropped in silence. That is the worst kind
+of bug, because it looks like it is applying. Settings lists all **30 prebuilt voices**
+with their character word, and a boot check fails if the picker and the JS table ever
+drift, since an unrecognised name is either ignored or rejects the frame.
+
+**Audition by ear, don't guess at adjectives.** "Warm", "Firm", "Breezy" mean different
+things to different people, so the sheet renders the selected voice reading a real
+Hinglish line via the TTS row (free tier, no dependency, raw 24 kHz PCM wrapped into a
+WAV in the browser). It deliberately sends *no* style directive in the text, because some
+TTS rows read an instruction aloud instead of acting on it. In keysafe mode the sample
+goes through `POST /tts` so the key still never reaches the browser.
+
+**Voice feel** is a small fixed chain on the output — low-shelf body, a 3.2 kHz cut for
+the sibilance that makes synthetic voices hiss, and a compressor so an excited read does
+not clip a phone speaker. No cost, no network, switchable off; changing it mid-call
+applies to the rest of that call. The tests assert the filter nodes carry the numbers and
+that the chain reaches `destination` — a chain built but not wired is exactly as silent
+as no chain.
+
+**A blocked microphone cannot cancel the call.** It used to: `getUserMedia` failed and
+`connect()` returned, so no session at all — even though *hearing* the agent needs no
+microphone. Now it classifies the cause (insecure origin, embedder that did not set
+`allow="microphone"`, permission dismissed, no device, device busy, constraints refused),
+says that one thing, offers *Open in a new tab*, and carries on as **text in · voice
+out**. The state chip says so too, and hides mute and push-to-talk — controls for a
+device the browser never handed over. Default voice is **Sulafat (Warm)** rather than a
+firm read-aloud tone, because this is a phone call, not a narration.
+
 ## What's in the box
 
 | File | Role |
