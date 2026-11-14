@@ -87,6 +87,38 @@ Design decisions worth defending:
   the harness has no real DOM, which is exactly the difference between "renders in
   Chrome" and "crashes on a phone with no oscillator".
 
+## "It says connecting but not"
+
+A failed WebSocket upgrade tells the browser nothing: no status, no body, sometimes only
+code 1006 — and if the network drops it silently, *nothing at all*. So the handshake has
+a 9 s deadline, and every way it can fail ends in a sentence naming the cause plus one
+automated change, never a spinner:
+
+| Failure | What the app does |
+| --- | --- |
+| Model row retired (free-tier names churn; from the socket it looks exactly like a bad key) | Asks the key which `*live*` rows exist, retries on one of those, and **banks the row that connected** so a reload doesn't start from the broken guess again |
+| Row is fine | Says so, and retries with a minimal setup frame — the other variable |
+| Key refused (400/401/403) | Says Google refused the key; no pointless retry |
+| API unreachable at all | Says the browser and Google cannot talk from here — which is also the reason the call fails |
+| Two tries used up | Stops, with the reason on screen, instead of looping |
+
+Exactly one thing changes per attempt, so a success means something. Live rows are ranked
+with native-audio first, because a row that connects and then has no audio to play is
+misread as an audio bug forever. Settings shows how many Live rows your key can see and
+flags a current row it cannot find **before** you press Start.
+
+Two things found on the way, both real:
+
+- **`teardown()` closed the socket, whose close event ran the diagnosis, which called
+  `teardown()` again.** Handlers are now detached before closing, which also fixes the
+  user-visible half: hanging up while stuck on "Connecting…" would have *reopened* a call
+  you just cancelled.
+- **`teardown()` used to `close()` the AudioContext every call.** Tidy, and wrong: Chrome
+  caps live contexts per page and then refuses new ones *silently*, so by the seventh
+  call of a session the output graph is simply gone — a "TTS stopped working after an
+  hour" bug with no error anywhere. The context is a page-level resource; per-call
+  teardown drops only that call's graph.
+
 ## The voice, and the microphone
 
 **The voice you pick is the voice you get.** `setup.generationConfig.speechConfig.

@@ -36,6 +36,7 @@ class El {
     this.scrollHeight = 0;
   }
   append(...n) { this.children.push(...n); }
+  appendChild(n) { this.children.push(n); return n; } // the DOM API app.js actually calls
   replaceChildren(...n) { this.children = n; }
   remove() {}
   focus() { this._focused = true; }
@@ -155,6 +156,22 @@ class FakeWebSocket {
 const fetches = [];
 const fetch = async (u, o) => {
   fetches.push({ url: String(u), opts: o || {} });
+  const dest = fetches.at(-1).url;
+  if (/\/models(\?|$)/.test(dest) && !dest.includes('generateContent')) {
+    // Deliberately a list that does NOT contain the configured preview row: retired
+    // model rows are the failure this path exists to catch.
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ models: [
+        { name: 'models/gemini-2.0-flash-001', supportedGenerationMethods: ['generateContent'] },
+        // A text-only Live row listed FIRST on purpose: it would connect and then have
+        // nothing to play, so the picker must rank the native-audio row above it.
+        { name: 'models/gemini-2.5-flash-live-preview' },
+        { name: 'models/gemini-live-2.5-flash-native-audio' },
+      ] }),
+    };
+  }
   if (fetches.at(-1).url.includes('generateContent')) {
     // One second of raw 24 kHz signed-16 mono — deliberately *not* RIFF, so the
     // client's WAV framing has to run for the sample to be playable at all.
@@ -190,6 +207,16 @@ sandbox.window.isSecureContext = true;
 // ── run it ────────────────────────────────────────────────────────────────
 const tick = (n = 6) => new Promise((r) => setTimeout(r, n));
 const results = [];
+// A stall cannot be caught by another timer (the failure mode freezes the timer phase
+// outright), so it is caught on the way out: beforeExit fires when the loop drains.
+let suiteFinished = false;
+process.on('beforeExit', () => {
+  if (!suiteFinished) {
+    console.log(' FAIL  suite stalled before finishing — an await never settled, which '
+      + 'usually means the app recursion or a hung fake; not a pass');
+    process.exitCode = 1;
+  }
+});
 const check = (name, fn) => {
   try { fn(); results.push(['  ok  ', name]); }
   catch (e) { results.push([' FAIL ', name + ' :: ' + e.message]); process.exitCode = 1; }
@@ -805,7 +832,138 @@ check('index.html nests cleanly', () => {
   assert.deepEqual(errs, [], errs.join(' | '));
 });
 
+// ── "it says connecting but not": the handshake must always land somewhere ─────
+// A failed WebSocket upgrade gives the browser nothing — no status, no body, often
+// only code 1006. Everything below exists so the user is never left holding a spinner.
+const settle = (ms = 650) => new Promise((r) => setTimeout(r, ms));
+const threadText = () => (reg.get('thread').children || []).map((c) => c.textContent || '').join('\n');
+
+if (reg.get('hangup').hidden === false) { reg.get('hangup').fire('click'); await settle(80); }
+const beforeLadder = sockets.length;
+reg.get('pttBtn').fire('click');
+await settle(80);
+const s1 = sockets.at(-1);
+
+check('the ladder test has a live, unsettled socket to break', () => {
+  assert.equal(sockets.length, beforeLadder + 1, 'expected exactly one new socket');
+  assert.equal(typeof s1.onclose, 'function', 'the app did not attach its close handler');
+});
+
+s1.onclose({ code: 1006, reason: '' });
+await settle();
+
+check('a dead socket is diagnosed against the key, not shrugged at', () => {
+  const probe = fetches.filter((f) => f.url.includes('/models'));
+  assert.ok(probe.length, 'no model probe was made when the socket died');
+  assert.match(probe.at(-1).url, /pageSize=200/);
+  assert.match(threadText(), /not a row this key can see/, 'nothing said why: ' + threadText().slice(-150));
+  assert.match(reg.get('modelHint').textContent, /is not visible to this key/);
+  assert.equal(reg.get('modelHint').dataset.bad, '1');
+});
+
+check('the model picker is filled from what the key can see', () => {
+  const dl = reg.get('modelList');
+  assert.ok(dl.children.length >= 2, 'datalist still empty: ' + dl.children.length);
+  // A text-only Live row must not outrank a native-audio one: it would connect and
+  // then have nothing to play.
+  assert.equal(dl.children.find((k) => /live/i.test(k.value)).value, 'models/gemini-live-2.5-flash-native-audio');
+});
+
+check('the first retry changes exactly one thing: the row, frame untouched', () => {
+  const s2 = sockets.at(-1);
+  assert.notEqual(s2, s1, 'no retry socket appeared');
+  const setup = s2.frames('setup')[0].setup;
+  assert.equal(setup.model, 'models/gemini-live-2.5-flash-native-audio');
+  assert.ok(setup.generationConfig?.speechConfig, 'the frame was degraded too — two variables changed at once');
+  assert.ok(setup.systemInstruction, 'the persona was dropped along with it');
+});
+
+const s2 = sockets.at(-1);
+s2.onclose({ code: 1006, reason: '' });
+await settle();
+
+check('the second failure varies the frame, since the row is now correct', () => {
+  const s3b = sockets.at(-1);
+  assert.notEqual(s3b, s2, 'no second retry socket');
+  const setup = s3b.frames('setup')[0].setup;
+  assert.equal(setup.model, 'models/gemini-live-2.5-flash-native-audio');
+  assert.equal(setup.generationConfig, undefined, 'the minimal retry must send the plain frame');
+});
+
+const s3 = sockets.at(-1);
+s3.from({ setupComplete: {} });
+await settle(80);
+
+check('the row that actually connected is banked, not merely used', () => {
+  const saved = JSON.parse(localStorage.getItem('aryans-aicall/v0'));
+  assert.equal(saved.model, 'models/gemini-live-2.5-flash-native-audio',
+    'otherwise the next reload retries the broken row from scratch');
+  assert.match(threadText(), /saved as your model row/);
+});
+
+// The bug this encodes: teardown() closes the socket, the close event routed into the
+// diagnosis, the diagnosis called teardown() again — recursion, and worse, a retry that
+// reopened a call the user had just cancelled.
+const socketsAtHangup = sockets.length;
+reg.get('hangup').fire('click');
+await settle(200);
+check('a hangup is not a connection failure, and never reopens the call', () => {
+  assert.equal(sockets.length, socketsAtHangup, 'hanging up opened another socket');
+  assert.match(reg.get('modePill').textContent, /idle/);
+});
+
+check('the spinner cannot last forever: deadline armed, deduped, cancelled on success', () => {
+  const body = /async function connect\(\) \{([\s\S]*?)\n\}/.exec(app)[1];
+  assert.match(body, /armHandshake\(\)/, 'connect() never arms the handshake deadline');
+  const ms = Number(/const HANDSHAKE_MS = (\d+);/.exec(app)[1]);
+  assert.ok(ms >= 3000 && ms <= 20000, `deadline of ${ms}ms is either flaky or cruel`);
+  assert.match(app, /if \(diagOnce\) return;/, 'error and close both fire: one failure must not book two retries');
+  assert.match(app, /clearTimeout\(handshakeTimer\);\n\s*handshakeTries = 0;/, 'setupComplete must cancel the deadline');
+  assert.match(app, /handshakeTries >= 2/, 'no cap on retries — a dead network would loop forever');
+  assert.match(app, /Stopping here rather than retrying forever/);
+});
+
+check('a thrown WebSocket constructor is reported, not swallowed', () => {
+  const body = /async function connect\(\) \{([\s\S]*?)\n\}/.exec(app)[1];
+  assert.match(body, /try \{\s*ws = new WebSocket\(url\);/, 'construction is unguarded');
+  assert.match(body, /Could not open the socket at all/);
+});
+
+check('teardown detaches handlers before closing', () => {
+  const t = /function teardown\(\) \{([\s\S]*?)\n\}/.exec(app)[1];
+  assert.match(t, /ws = null;\n\s*if \(sock\)/, 'the socket must be unreachable before close fires its event');
+  assert.match(t, /sock\.onclose = null;/);
+});
+
+check('the AudioContext survives a hangup instead of being closed', () => {
+  // Chrome caps live contexts per page (~6) and then refuses more, silently: a
+  // per-call close() is how "TTS stopped working after a while" gets written.
+  assert.doesNotMatch(app, /actx\?\.close\(\)/, 'teardown must not close the page-level context');
+  const t = /function teardown\(\) \{([\s\S]*?)\n\}/.exec(app)[1];
+  assert.match(t, /el\.outGain\?\.disconnect\(\)/, 'teardown should still drop this call\u2019s graph');
+});
+
+check('the model probe works in keysafe mode too', () => {
+  const path = /const MODELS_PATH = '([^']+)'/.exec(app);
+  assert.ok(path, 'MODELS_PATH missing');
+  const srv = fs.readFileSync(fileURLToPath(new URL('../server.mjs', import.meta.url)), 'utf8');
+  assert.ok(srv.includes(`url.pathname === '/${path[1]}'`), `server has no /${path[1]} route`);
+  assert.match(srv, /'x-goog-api-key': GEMINI_API_KEY/);
+  // "Test" must not keep a private probe, or it can pass while connect() fails.
+  assert.match(app, /const info = await refreshModels\(false\);/);
+  assert.ok(!/\?key=\$\{encodeURIComponent\(k\)\}/.test(app), 'sheetTest still builds its own URL');
+});
+// A suite that cannot finish must not look like a suite that passed. An early exit —
+// a frozen event loop, a top-level throw — used to print nothing at all and leave the
+// shell with a nonzero code but no reason, which is how a real recursion bug in
+// teardown() went nearly unnoticed. Count the checks the file declares and insist every
+// one reported a verdict.
+const src = fs.readFileSync(fileURLToPath(import.meta.url), 'utf8');
+const declared = (src.match(/^\s*check\(['"]/gm) || []).length;
+results.push([results.length === declared ? '  ok  ' : ' FAIL ', `every declared check reported a verdict (${results.length}/${declared})`]);
+
 for (const [s, n] of results) console.log(s, n);
 const failed = results.filter(([s]) => s.includes('FAIL')).length;
 console.log(`\n${results.length - failed}/${results.length} boot checks passed`);
 if (failed) process.exitCode = 1;
+suiteFinished = true;

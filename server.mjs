@@ -19,6 +19,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+const GEMINI_ROOT = 'https://generativelanguage.googleapis.com/v1beta';
 const TTS_UPSTREAM =
   'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent';
 
@@ -81,6 +82,31 @@ const server = http.createServer(async (req, res) => {
     // Tells the page whether it may talk to Google directly or must use us.
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ keysafe: PROXY && Boolean(GEMINI_API_KEY) }));
+    return;
+  }
+
+  if (url.pathname === '/models') {
+    // Model discovery for the settings sheet, keysafe mode only — same reasoning as
+    // /tts: the picker cannot be the one thing that only works when the key sits in
+    // browser storage. Read-only passthrough, nothing buffered.
+    if (!PROXY || !GEMINI_API_KEY) {
+      res.writeHead(409, { 'content-type': 'application/json' }).end(
+        JSON.stringify({ error: { message: 'server is not in keysafe mode — the page should call Google directly' } })
+      );
+      return;
+    }
+    try {
+      const up = await fetch(`${GEMINI_ROOT}/models?pageSize=200`, {
+        headers: { 'x-goog-api-key': GEMINI_API_KEY },
+      });
+      const text = await up.text();
+      res.writeHead(up.status, { 'content-type': up.headers.get('content-type') || 'application/json' });
+      res.end(text);
+    } catch (e) {
+      res.writeHead(502, { 'content-type': 'application/json' }).end(
+        JSON.stringify({ error: { message: `upstream ${e.message}` } })
+      );
+    }
     return;
   }
 

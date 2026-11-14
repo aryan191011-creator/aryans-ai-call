@@ -123,6 +123,18 @@ let cfg = load();
 // explicitly — the preview reaches us over an https proxy and a wrong scheme
 // here is a connection that dies before a single audio frame moves.
 const RELAY = location.origin.replace(/^http/, 'ws') + '/relay';
+const API_ROOT = 'https://generativelanguage.googleapis.com/v1beta';
+const MODELS_PATH = 'models';
+
+/*
+ * A WebSocket that is refused, blocked or pointed at a retired model row tells the
+ * browser almost nothing: no status, no body, sometimes only code 1006 — and if the
+ * handshake is silently dropped, nothing at all. So "Connecting…" gets a deadline, and
+ * every way it can fail gets a sentence that names the cause. A spinner that never
+ * resolves is the state people hate most in a voice app, and it is also the one that
+ * makes them blame their own key.
+ */
+const HANDSHAKE_MS = 9000;
 const DIRECT =
   'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta' +
   '.GenerativeService.BidiGenerateContent';
@@ -769,14 +781,30 @@ async function connect() {
   setMode('connecting', 'connecting');
   el.say.textContent = 'Connecting…';
   const url = cfg.keysafe ? `${RELAY}` : `${DIRECT}?key=${encodeURIComponent(cfg.key)}`;
-  ws = new WebSocket(url);
+  try {
+    ws = new WebSocket(url);
+  } catch (e) {
+    // A thrown constructor means the URL itself is unusable — a config bug, not a
+    // Google problem, and it used to escape into an unhandled rejection while the chip
+    // stayed on "connecting" forever.
+    setMode('error', 'error');
+    el.say.textContent = 'Connect failed.';
+    note(`Could not open the socket at all: ${e.message}`, 'err');
+    return;
+  }
+  armHandshake();
   ws.onopen = () => send(triedMinimal ? minimalSetup() : fullSetup());
   ws.onmessage = onMessage;
   ws.onclose = (e) => {
-    if (!settled && e.code === 1006) note('Socket died before setup — model name or key?', 'err');
+    if (!settled) {
+      failHandshake(`socket closed${e.code ? ` with code ${e.code}` : ''}${e.reason ? `: ${e.reason}` : ''}`);
+      return; // failHandshake owns the teardown
+    }
     teardown();
   };
-  ws.onerror = () => note('WebSocket error — open DevTools console for the frame.', 'err');
+  ws.onerror = () => {
+    if (!settled) failHandshake('socket error before setup');
+  };
 }
 
 function onMessage(ev) {
@@ -789,6 +817,16 @@ function onMessage(ev) {
 
   if (m.setupComplete) {
     settled = true;
+    clearTimeout(handshakeTimer);
+    handshakeTries = 0;
+    if (pendingModelFix) {
+      // The row that actually connected is worth keeping; the one in the file is a
+      // guess about what Google shipped when it was written.
+      const fixed = pendingModelFix;
+      pendingModelFix = '';
+      save({ ...cfg, model: fixed });
+      note(`Connected on ${shortModel(fixed)} — saved as your model row.`, 'sys');
+    }
     stats.calls++;
     el.sCalls.textContent = stats.calls;
     el.hangup.hidden = false;
@@ -940,18 +978,169 @@ async function handleToolCall(call) {
   if (responses.length) send({ toolResponse: { functionResponses: responses } });
 }
 
+const shortModel = (m) => String(m || '').replace(/^models\//, '');
+const qualify = (m) => (String(m || '').startsWith('models/') ? m : `models/${m}`);
+
+/**
+ * Ask the key which Live rows exist, rather than guessing from a list baked into this
+ * file. Preview model rows get retired and renamed on a schedule, and from the socket's
+ * side a retired row is indistinguishable from a bad key — both are a dead 1006.
+ */
+async function listLiveModels() {
+  // Keysafe mode holds the key on the server, so discovery goes through it too; a
+  // picker that only works in the weaker mode is not a picker.
+  const r = cfg.keysafe
+    ? await fetch(`${location.origin}/${MODELS_PATH}`)
+    : await fetch(`${API_ROOT}/models?pageSize=200&key=${encodeURIComponent(cfg.key)}`);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error(j?.error?.message || `HTTP ${r.status}`), { status: r.status });
+  const rows = Array.isArray(j.models) ? j.models : [];
+  const live = rows.map((m) => m.name).filter((n) => typeof n === 'string' && /live/i.test(n));
+  // Rank, do not just collect. A Live row without native audio would connect and then
+  // have nothing to play — the worst outcome, since "connected" and "silent" together
+  // look like an audio bug rather than a model-choice bug. Both the picker and the
+  // auto-retry read from this order.
+  const rank = (n) => (/native-audio/i.test(n) ? 2 : 0) + (/2\.5|3\./.test(n) ? 1 : 0);
+  return live.sort((a, b) => rank(b) - rank(a));
+}
+
+/** Refresh the picker, validate the current choice, and return what it found. */
+async function refreshModels(quiet = false) {
+  if (!cfg.key && !cfg.keysafe) return null;
+  let live;
+  try {
+    live = await listLiveModels();
+  } catch (e) {
+    const bad = e.status === 400 || e.status === 401 || e.status === 403;
+    const msg = bad
+      ? `Google refused this key (${e.status}): ${e.message}`
+      : `The API could not be reached to check (${e.message}). A browser that cannot reach the model list cannot reach the call either — that is usually the sandbox/proxy, not your key.`;
+    if (!quiet) note(msg, 'err');
+    const hint = $('modelHint');
+    if (hint) { hint.textContent = msg; hint.dataset.bad = '1'; }
+    return { error: msg, live: [], ok: false, best: '' };
+  }
+  // The picker is a convenience; the validation below it is what prevents a failed
+  // call. Build the whole list, then write it once: a save-time refresh and a
+  // connect-failure refresh running at the same moment would otherwise clear each
+  // other half-done. And a DOM write must never take the diagnosis down with it.
+  try {
+    const dl = $('modelList');
+    if (dl) {
+      const opts = live.map((n) => {
+        const o = document.createElement('option');
+        o.value = n;
+        return o;
+      });
+      if (dl.replaceChildren) dl.replaceChildren(...opts);
+      else for (const o of opts) dl.appendChild(o);
+    }
+  } catch {}
+  const cur = qualify(cfg.model);
+  const ok = !live.length || live.includes(cur);
+  const best = live[0] || ''; // already ranked by listLiveModels
+  const hint = $('modelHint');
+  if (hint) {
+    hint.textContent = !live.length
+      ? 'This key sees no Live rows at all — free-tier rows move; another key or tomorrow usually fixes it.'
+      : ok
+        ? `${live.length} Live rows on this key, including ${shortModel(cur)}.`
+        : `${shortModel(cur)} is not visible to this key. It will fail to connect. Try ${shortModel(best)}.`;
+    hint.dataset.bad = ok ? '' : '1';
+  }
+  return { live, ok, best: best ? qualify(best) : '' };
+}
+
+let pendingModelFix = '';
+
+/** The socket died or never answered: name why, then change exactly one thing. */
+let handshakeTimer = null;
+let diagOnce = false;
+let handshakeTries = 0;
+
+function armHandshake() {
+  clearTimeout(handshakeTimer);
+  diagOnce = false;
+  handshakeTimer = setTimeout(() => {
+    if (!settled) failHandshake(`no setupComplete within ${HANDSHAKE_MS / 1000}s`);
+  }, HANDSHAKE_MS);
+}
+
+async function failHandshake(tag) {
+  if (diagOnce) return; // error and close both fire for one failure; diagnose once
+  diagOnce = true;
+  clearTimeout(handshakeTimer);
+  setMode('connecting', 'connecting');
+  el.say.textContent = 'Not connected — checking what your key can see…';
+  const info = await refreshModels(true);
+  let why = `Could not connect (${tag}).`;
+  let one = '';
+  let swapped = false;
+  if (info?.error) {
+    why = info.error;
+  } else if (info && !info.ok && info.best && info.best !== qualify(cfg.model)) {
+    why += ` "${shortModel(cfg.model)}" is not a row this key can see.`;
+    one = `Retrying with "${shortModel(info.best)}".`;
+    pendingModelFix = info.best;
+    cfg.model = info.best;
+    swapped = true;
+  } else if (info) {
+    why += ' The model row is fine, so the problem is the path or the frame: a blocked wss:// (corporate proxy, an extension, or an embedder without the right policy), or a setup config this endpoint refused.';
+    one = 'Retrying with a minimal setup frame — voice and VAD fall back to defaults.';
+  } else {
+    why += ' Nothing to probe from here: no key on this page and no server route.';
+    one = 'Paste a key in Settings, then Start again.';
+  }
+  if (handshakeTries >= 2) {
+    note(why + ' Stopping here rather than retrying forever — the reason above is the thing to fix.', 'err');
+    handshakeTries = 0;
+    teardown();
+    return;
+  }
+  handshakeTries++;
+  // Vary one thing per try, so a success means something: the model row when the row is
+  // what is missing, otherwise the frame. Decided now, in a local, because teardown()
+  // clears triedMinimal and reading the flag after it would always say "full frame".
+  const useMinimal = !swapped;
+  triedMinimal = useMinimal;
+  note(`${why}${one ? ' ' + one : ''}`, 'sys');
+  teardown();
+  // Set again *after* teardown, which resets it on purpose so a manual Start gets a
+  // fresh full attempt. Without this the retry changes two things at once and a
+  // success tells you nothing about which fix worked.
+  if (useMinimal) triedMinimal = true;
+  setTimeout(start, 400);
+}
+
 function teardown() {
+  clearTimeout(handshakeTimer);
   kickedOff = false;
   micBlocked = false; // a new call earns a new greeting
   flushPlayback();
   closeMic();
-  try { ws?.close(); } catch {}
+  // Detach before closing. Two reasons, both real: (1) a deliberate close must not be
+  // diagnosed as a connection failure — hanging up while the handshake is still pending
+  // used to fire onclose -> failHandshake -> teardown -> close() recursion, and would
+  // reopen a call the user just cancelled; (2) the handlers must not outlive the socket
+  // they were written for.
+  const sock = ws;
   ws = null;
+  if (sock) {
+    sock.onclose = null;
+    sock.onerror = null;
+    sock.onmessage = null;
+    sock.onopen = null;
+    try { sock.close(); } catch {}
+  }
   settled = false;
   triedMinimal = false;
   agentSpeaking = false;
-  actx?.close().catch(() => {});
-  actx = null;
+  // The AudioContext is a *page* resource, not a per-call one. Closing it here used to
+  // look tidy and was not: Chrome caps live contexts per page (~6) and then refuses new
+  // ones silently, so the seventh call of a session would have no output graph at all —
+  // a "TTS stopped working" bug that only shows up after an hour of use. Reuse the
+  // context, tear down only this call's graph, and stay ready for the next one.
+  try { el.outGain?.disconnect(); } catch {}
   blip('close');
   el.muteBtn.hidden = true;
   muted = false;
@@ -1177,6 +1366,7 @@ $('sheetSave').addEventListener('click', () => {
   // Tone is live: rebuilding the output graph applies it to the rest of this call
   // instead of making the user hang up to hear whether it helped.
   if (actx) { el.outGain = null; buildOutput(); }
+  refreshModels(true); // validate the row this key can actually see
   closeSheet();
   note('Saved. Restart the session to apply.', 'sys');
   if (ws) { teardown(); note('Session restarted with the new settings — tap the mic again.', 'sys'); }
@@ -1186,25 +1376,21 @@ $('sheetTest').addEventListener('click', async () => {
   el.sheetLog.hidden = false;
   el.sheetLog.textContent = 'probing…';
   const k = $('fKey').value.trim();
-  if (!k) return (el.sheetLog.textContent = 'no key');
-  // A cheap REST probe: no audio, no quota burn, answers "does this key exist
-  // and can it see that model row".
-  try {
-    const r = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(cfg.model.replace('models/', ''))}?key=${encodeURIComponent(k)}`
-    );
-    const j = await r.json().catch(() => ({}));
-    if (r.ok) {
-      el.sheetLog.textContent = `OK — ${cfg.model}\nmethods: ${(j.supportedGenerationMethods || []).join(', ')}`;
-      if (!String(j.supportedGenerationMethods || '').includes('streamGenerateContent')) {
-        el.sheetLog.textContent += '\n⚠ no streaming method listed — Live API may refuse this row.';
-      }
-    } else {
-      el.sheetLog.textContent = `${r.status} ${j?.error?.status || ''}\n${j?.error?.message || 'no body'}`;
-    }
-  } catch (e) {
-    el.sheetLog.textContent = 'fetch failed: ' + e.message + '\n(brain is behind the proxy? use PROXY=1 mode)';
-  }
+  if (!k && !cfg.keysafe) return (el.sheetLog.textContent = 'no key');
+  // Same code path the connect failure uses, so "Test" cannot pass while the real
+  // thing is broken — two probes with two answers is how these drift.
+  const was = cfg.key;
+  cfg.key = k || cfg.key;
+  const info = await refreshModels(false);
+  cfg.key = was;
+  if (!info) return (el.sheetLog.textContent = 'nothing to ask: no key on this page');
+  if (info.error) return (el.sheetLog.textContent = info.error);
+  el.sheetLog.textContent = [
+    `${info.live.length} Live rows visible to this key`,
+    info.ok ? `current row OK: ${shortModel(cfg.model)}` : `current row MISSING: ${shortModel(cfg.model)}`,
+    ...info.live.slice(0, 8).map((n) => `  · ${shortModel(n)}${n === qualify(cfg.model) ? '  ← in use' : ''}`),
+    info.live.length > 8 ? `  … and ${info.live.length - 8} more in the picker` : '',
+  ].filter(Boolean).join('\n');
 });
 
 (async () => {
@@ -1213,6 +1399,9 @@ $('sheetTest').addEventListener('click', async () => {
   try {
     const c = await (await fetch('/config')).json();
     cfg.keysafe = Boolean(c.keysafe);
+    // Know before you tap Start: a retired row and a bad key look identical from the
+    // socket (a dead 1006), so ask the REST endpoint instead and say so up front.
+    refreshModels(true);
     save(cfg);
     if (cfg.keysafe) el.keyWarn.textContent = 'Server holds the key (proxy mode). Nothing to paste.';
   } catch {}
