@@ -394,6 +394,43 @@ check('every id in the HTML is reachable by the app', () => {
 
 
 // ── the research rules, checked against the actual markup and stylesheet ────
+// ── the cascade trap that pinned the overlay open ───────────────────────────
+check('hidden actually hides: the [hidden] guard survives the cascade', () => {
+  // The UA sheet has [hidden]{display:none}, but an author rule that sets
+  // `display` on the same element wins on cascade ORIGIN, so specificity never
+  // gets a say. Result: el.hidden = true silently does nothing and an overlay is
+  // un-closable. A global !important is the only reliable fix.
+  const guard = /\[hidden\]\s*\{[^}]*display:\s*none\s*!important/.test(css);
+  assert.ok(guard, 'no [hidden]{display:none !important} rule in styles.css');
+});
+check('no element hidden in the markup carries a display rule that outranks it', () => {
+  // Which elements are authored hidden, and does any CSS rule give them a display?
+  const hiddenEls = [...html.matchAll(/<(\w+)([^>]*\bhidden\b[^>]*)>/g)].map((m) => {
+    const attrs = m[2];
+    const id = /id="([^"]+)"/.exec(attrs)?.[1];
+    const cls = /class="([^"]+)"/.exec(attrs)?.[1]?.split(/\s+/) || [];
+    return { tag: m[1], id, cls };
+  });
+  assert.ok(hiddenEls.length >= 4, 'expected several hidden-by-default elements, saw ' + hiddenEls.length);
+  const offenders = [];
+  for (const el2 of hiddenEls) {
+    const names = [el2.id && '#' + el2.id, ...el2.cls.map((c) => '.' + c)].filter(Boolean);
+    for (const nm of names) {
+      for (const m of css.matchAll(new RegExp('(^|\\})[^{}]*' + nm.replace(/[$()*+.?[\\\]^{|}/\\]/g, '\\$&') + '[^{]*\\{([^}]*)\\}', 'gm'))) {
+        if (/display:\s*(?!none)/.test(m[2])) offenders.push(nm + ' { ' + m[2].trim().slice(0, 40) + ' }');
+      }
+    }
+  }
+  // Offenders are survivable *only* because of the !important guard — if someone
+  // deletes that rule, this list becomes a live bug again.
+  if (offenders.length) {
+    assert.ok(/display:\s*none\s*!important/.test(css),
+      'elements hidden in markup but given a display by CSS: ' + [...new Set(offenders)].join(', '));
+  }
+  // The settings dialog specifically must never be visible before it is opened.
+  assert.match(html, /<div class="sheet" id="sheet" hidden>/, 'the sheet must start hidden in the HTML itself');
+});
+
 check('the guard trade-off is explicit in the saved config', () => {
   const saved = JSON.parse(localStorage.getItem('aryans-aicall/v0'));
   assert.equal(saved.guard, false, 'barge-in tests are meaningless if the guard silently stayed on');
@@ -504,6 +541,36 @@ check('the new socket got the connected signal', () => {
   const kick = ws2.frames('clientContent');
   assert.equal(kick.length, 1, 'kickedOff was not reset by teardown');
   assert.ok(kick[0].clientContent.turns[0].parts[0].text.startsWith('<<connected>>'));
+});
+
+// ── closing the dialog, by every route a person would try ───────────────────
+check('the dialog opens and closes through the backdrop, the button and Esc', () => {
+  const sheet = reg.get('sheet');
+  const esc = () => { for (const fn of docHandlers.keydown || []) fn({ code: 'Escape' }); };
+
+  reg.get('gearBtn').fire('click');
+  assert.equal(sheet.hidden, false, 'gear button did not open the dialog');
+
+  // a press starting inside the card and releasing on the backdrop must not close
+  reg.get('sheet').fire('click', { target: reg.get('fKey') });
+  assert.equal(sheet.hidden, false, 'click that began on a field dismissed the dialog');
+
+  reg.get('sheet').fire('click', { target: sheet });   // a real backdrop tap
+  assert.equal(sheet.hidden, true, 'backdrop tap did not close the dialog');
+
+  reg.get('gearBtn').fire('click');
+  reg.get('sheetClose').fire('click');
+  assert.equal(sheet.hidden, true, 'the × button did not close the dialog');
+
+  reg.get('gearBtn').fire('click');
+  esc();
+  assert.equal(sheet.hidden, true, 'Esc did not close the dialog');
+
+  // Esc must not be swallowed by the dialog once it is gone
+  reg.get('gearBtn').fire('click');
+  esc();
+  reg.get('sheet').fire('click', { target: sheet });
+  assert.equal(sheet.hidden, true, 'dialog must end up closed, whatever order the taps came in');
 });
 
 for (const [s, n] of results) console.log(s, n);

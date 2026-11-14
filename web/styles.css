@@ -210,6 +210,14 @@ main { display: grid; grid-template-rows: auto 1fr; min-height: 0; }
 .meters { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .lvl { display: flex; align-items: center; gap: 6px; flex: 1 1 84px; min-width: 70px; }
 .tag { font: 600 .6rem/1 ui-monospace, monospace; color: var(--ink-3); text-transform: uppercase; }
+/* `hidden` must win, always. The UA's [hidden]{display:none} is a *UA* rule, so any
+   author rule that sets `display` on the same element beats it by cascade origin
+   alone — specificity never enters into it. `.sheet{display:grid}` did exactly that:
+   the settings overlay was visible from first paint, `closeSheet()` set hidden=true
+   and nothing happened, and a fixed inset:0 z-index:20 layer ate every click, so the
+   call could not even be started. Every `.hidden` toggle in app.js depends on this. */
+[hidden] { display: none !important; }
+
 .lvl i { flex: 1; height: 3px; background: var(--surface-3); border-radius: 99px; overflow: hidden; }
 .lvl b { display: block; height: 100%; width: 0; border-radius: 99px; transition: width 80ms linear; }
 .lvl:first-child b { background: var(--you); }

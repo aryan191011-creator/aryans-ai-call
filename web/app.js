@@ -872,6 +872,12 @@ const closeSheet = () => {
 };
 $('gearBtn').addEventListener('click', () => (el.sheet.hidden ? openSheet() : closeSheet()));
 $('sheetClose').addEventListener('click', closeSheet);
+// Dismiss by tapping the dimmed area — the reflex everyone has on a bottom sheet.
+// Compare the event target to the sheet itself, so a press that starts on a field
+// and releases over the backdrop cannot close the dialog and lose what was typed.
+el.sheet.addEventListener('click', (e) => {
+  if (e.target === el.sheet) closeSheet();
+});
 $('sheetSave').addEventListener('click', () => {
   cfg = load();
   cfg = {

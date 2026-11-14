@@ -67,6 +67,18 @@ Design decisions worth defending:
 - **A blank persona cannot be saved.** `{...DEFAULTS, ...saved}` let a stored
   `prompt: ""` override the default, shipping an empty `systemInstruction` and
   silently stripping every phone-audio rule. Both load and save repair it.
+- **`[hidden]{display:none !important}` is load-bearing, not decoration.** The UA's
+  `[hidden]` rule is a *UA-origin* rule, so any author rule that sets `display` on the
+  same element wins on cascade origin — specificity never gets a vote. `.sheet{display:
+  grid}` did that: the settings dialog was visible on first paint, `closeSheet()` set
+  `hidden = true` and nothing happened, and a `position:fixed; inset:0; z-index:20`
+  layer ate every click, so the call could not be started at all. `#muteBtn` and
+  `#hangup` were the same trap (controls shown before a call existed). No headless test
+  can see this — there is no layout engine — so `check:boot` now asserts the guard
+  exists *and* that no element hidden in the markup carries a competing `display` rule.
+- **The dialog closes by every route a person tries**: the × button, Save, `Esc`, and a
+  tap on the dimmed backdrop. A press that starts on a field and releases over the
+  backdrop does not close it, so half-typed input is never lost.
 - **There is a text field.** "I am on a bus" is a normal reason voice fails, and a
   voice-first UI that offers no keyboard fallback just loses the call.
 - **Suggested openers replace the empty state.** Voice has no buttons, so
