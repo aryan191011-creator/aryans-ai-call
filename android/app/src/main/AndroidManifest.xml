@@ -26,13 +26,15 @@
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="true">
-        <!-- On for exactly one thing: `adb shell am start --es url http://192.168.x.x:8787/`,
-             which is how you look at this page on a real screen without rebuilding an APK. The
-             default bundle needs no cleartext at all — its own assets are served over a fake
-             https origin, and the API is wss. API 28+ defaults this to false, so leaving it
-             true has to be written down, which is also what makes it a decision instead of an
-             oversight. Note that a plain-http target has no microphone (not a secure context),
-             so that hook is for layout, not for testing a call. -->
+        <!-- On for exactly one thing: the `url` extra, sent from adb, pointing at a dev server
+             on your network — which is how you look at this page on a real screen without
+             rebuilding an APK. The default bundle needs no cleartext at all: its own assets are
+             served over a fake https origin, and the API is wss. API 28+ defaults this to
+             false, so leaving it true has to be written down, which is also what makes it a
+             decision instead of an oversight. A plain-http target has no microphone (not a
+             secure context), so that hook is for layout, not for testing a call.
+             (Wording note, since it cost a build: an XML comment may not contain a double
+             hyphen at all, so the adb line is described rather than quoted.) -->
 
         <activity
             android:name=".MainActivity"

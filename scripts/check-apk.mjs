@@ -50,6 +50,15 @@ function check(name, fn) {
     fails.push(`${name}\n      ${String(e.message).split('\n')[0]}`);
   }
 }
+const hasPython = () => {
+  try {
+    execFileSync('python3', ['--version'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 function skip(name, why) {
   skips.push(`${name} — ${why}`);
 }
@@ -256,6 +265,38 @@ check('the splash theme only exists where the attributes do', () => {
   }
 });
 
+check('every XML file the build reads is well-formed', () => {
+  // A real parser, not a regex. The bug this is for: an XML comment may not contain a double
+  // hyphen anywhere, so quoting `adb shell am start --es url …` in a comment about the dev hook
+  // made the manifest unparseable, and the manifest merger's answer was "Error parsing
+  // AndroidManifest.xml" with no line number and no hint that the offender was prose. It costs
+  // a whole build cycle to learn that any other way.
+  const files = [];
+  const walk = (d) => {
+    for (const e of readdirSync(ROOT + d, { withFileTypes: true })) {
+      if (e.isDirectory()) walk(`${d}/${e.name}`);
+      else if (e.name.endsWith('.xml')) files.push(`${d}/${e.name}`);
+    }
+  };
+  walk(A);
+  assert.ok(files.length >= 6, `expected the resource XML too, found ${files.join(', ')}`);
+  if (!hasPython()) {
+    skip('XML well-formedness', 'no python3 on this machine to run a parser');
+    return;
+  }
+  const bad = [];
+  for (const f of files) {
+    try {
+      execFileSync('python3', ['-c',
+        'import sys,xml.etree.ElementTree as E; E.parse(sys.argv[1])', ROOT + f],
+        { stdio: 'pipe' });
+    } catch (e) {
+      bad.push(`${f}: ${String(e.stderr || e.message).split('\n').pop().trim()}`);
+    }
+  }
+  assert.deepEqual(bad, [], `\n      ${bad.join('\n      ')}`);
+});
+
 check('the icon is a full set, and the adaptive XML points at real things', () => {
   const xml = read(paths.adaptive);
   assert.match(xml, /<adaptive-icon xmlns:android="http:\/\/schemas.android.com\/apk\/res\/android">/);
@@ -280,6 +321,21 @@ check('every R.string the Java reads is declared', () => {
     assert.ok(!/^\s*$/.test(read(paths.strings).match(new RegExp(`<string name="${m}">([^<]*)`))[1]),
       `empty string: ${m}`);
   }
+});
+
+check('Java references no resource kind this project does not declare', () => {
+  // R.string is the only resource the Activity refers to by name; the icons and the theme are
+  // reached from the manifest, which is aapt's job. An R.layout or R.id here would be a
+  // leftover from a deleted XML file, and javac's "cannot find symbol R.id" arrives with no
+  // hint that the file it wants was never written.
+  const kinds = [...java.matchAll(/R\.(\w+)\.(\w+)/g)];
+  const offenders = kinds.filter(([, kind]) => kind !== 'string');
+  assert.deepEqual(offenders, [], `referring to resources that do not exist: ${
+    offenders.map((m) => `R.${m[1]}.${m[2]}`).join(', ')}`);
+  assert.ok(kinds.length >= 2, 'expected the two death-note strings to be referenced');
+  // And no layout file may exist without being declared, or the reverse.
+  const layouts = readdirSync(`${ROOT}${A}/app/src/main/res`).filter((d) => d.startsWith('layout'));
+  assert.deepEqual(layouts, [], `a layout directory (${layouts}) with nothing to inflate it`);
 });
 
 check('no AndroidX import while useAndroidX is false', () => {
