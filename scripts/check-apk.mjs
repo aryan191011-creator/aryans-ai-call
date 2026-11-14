@@ -450,9 +450,14 @@ check('the failure channel itself is wired up', () => {
   // And a truncating pipe inside a pipefail block is a step that fails on success.
   const insp = /- name: What is actually in the APK[\s\S]*?\n {6}- /.exec(wf);
   assert.ok(insp, 'the inspection step is gone');
-  if (/set -euo pipefail|set -o pipefail/.test(insp[0])) {
+  if (/set -e/.test(insp[0])) {
     assert.doesNotMatch(insp[0], /\|\s*head -\d/,
       '`| head -N` under pipefail: the writer dies of SIGPIPE and the step fails for no reason');
+    // Every step that can fail has to write to the file the report reads, or it arrives with no
+    // description; the inspection step failing was exactly that, once.
+    assert.match(insp[0], /tee -a \/tmp\/ci\.log/, 'a failing step that does not tee fails silently');
+    assert.match(insp[0], /set -euxo pipefail|set -euxo/,
+      'the x flag is what turns "step 10 failed" into the line that failed');
   }
   assert.match(wf, /commits\/\$\{\{ github\.sha \}\}\/comments/, 'posted via the API, the one host reachable from here');
   // The token is the whole step: `gh` in a run step has no credentials unless you map one, and

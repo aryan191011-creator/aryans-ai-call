@@ -101,24 +101,31 @@ jobs:
         # was to say "yes, it's all in there" — and it only does it once there are more matching
         # lines than the head allows, so it passes for as long as it is a no-op.
         run: |
-          set -euo pipefail
-          apk=android/app/build/outputs/apk/release/app-release.apk
-          unzip -l "$apk" | grep -E 'assets/web/(index\.html|app\.js|styles\.css)'
-          unzip -l "$apk" | grep -cE 'res/mipmap-[a-z]*[0-9]+/ic_launcher(_round)?\.png'
-          unzip -p "$apk" AndroidManifest.xml >/dev/null
-          aapt2=$(ls -d "$ANDROID_HOME"/build-tools/*/aapt2 | tail -1)
-          "$aapt2" dump badging "$apk" > /tmp/badging.txt
-          grep -E "package:|uses-permission:|application-label:|sdkVersion:|targetSdkVersion:" /tmp/badging.txt
-          # The download must say the number the tag says — read off the APK, not build.gradle,
-          # because that is the only copy a user's App Info screen ever reads. Only on a tag
-          # run: on a branch push GITHUB_REF_NAME is "main", and asserting the APK says
-          # versionName='main' is a check that fires on the branch that is otherwise green.
-          case "${GITHUB_REF_NAME}" in
-            v[0-9]*) grep -qE "versionName='${GITHUB_REF_NAME#v}'" /tmp/badging.txt ;;
-            *) echo "not a tag (${GITHUB_REF_NAME}); skipping the versionName cross-check" ;;
-          esac
-          grep -q "uses-permission:'android.permission.RECORD_AUDIO'" /tmp/badging.txt
-          du -h "$apk"
+          # `x` as well: when a verification step dies, the one thing worth knowing is which line
+          # it died on, and `set -e` alone does not say. tee, because the report step reads this
+          # file and a step that fails without writing to it arrives undescribed.
+          {
+            set -euxo pipefail
+            apk=android/app/build/outputs/apk/release/app-release.apk
+            unzip -l "$apk" | grep -E 'assets/web/(index\.html|app\.js|styles\.css)'
+            unzip -l "$apk" | grep -cE 'res/mipmap-[a-z]*[0-9]+/ic_launcher(_round)?\.png'
+            unzip -p "$apk" AndroidManifest.xml >/dev/null
+            aapt2=$(ls -d "$ANDROID_HOME"/build-tools/*/aapt2 | tail -1)
+            "$aapt2" dump badging "$apk" > /tmp/badging.txt
+            grep -E "package:|uses-permission:|application-label:|sdkVersion:|targetSdkVersion:" /tmp/badging.txt
+            # The download must say the number the tag says — read off the APK, not build.gradle,
+            # because that is the only copy a user's App Info screen ever reads. Only on a tag
+            # run: on a branch push GITHUB_REF_NAME is "main", and asserting the APK says
+            # versionName='main' is a check that fires on the branch that is otherwise green.
+            case "${GITHUB_REF_NAME}" in
+              v[0-9]*) grep -qE "versionName='${GITHUB_REF_NAME#v}'" /tmp/badging.txt ;;
+              *) echo "not a tag (${GITHUB_REF_NAME}); skipping the versionName cross-check" ;;
+            esac
+            echo "release apk contents:"
+            unzip -l "$apk" | sed -n '1,40p'
+            grep -q "uses-permission:'android.permission.RECORD_AUDIO'" /tmp/badging.txt
+            du -h "$apk"
+          } 2>&1 | tee -a /tmp/ci.log
 
       - uses: actions/upload-artifact@v4
         with:
