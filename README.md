@@ -267,14 +267,24 @@ Design decisions that are load-bearing, not decorative:
   fields to the right level whatever a caller wrote, and audits the result against the field
   list Google's own client emits (`_LiveConnectConfig_to_mldev`, google-genai 3.3.0), logging a
   suspect line into `⚙` instead of trusting a memory of a docs page.
-- **A refused field is repaired, not punished.** Field names have churned across model
-  generations, and the first version of this app answered any unknown field by dropping the
-  whole config — voice, VAD and captions included, announced as "fall back to defaults". Now
+- **A field the *endpoint* refuses is retired, not punished — and never trusted from a type
+  definition.** Field names churn across model generations, and the first version of this app
+  answered any unknown field by dropping the whole config — voice, VAD and captions included, announced as "fall back to defaults". Now
   the refusal is read for the field it names: a generation knob is moved down one level, a
   field the row truly does not have is retired (at any path depth, and only for the row that
   refused it), and the minimal frame is what is left when nothing was named. The user keeps
   their voice. A successful connect refills the ladder, so this is bounded per failure run, not
-  per page load.
+  per page load. Two things this had to learn on a real phone, at 02:48:
+  `word_timestamp is not supported in BidiGenerateContent.` — a field that exists in
+  google-genai's `AudioTranscriptionConfig` and is refused by the endpoint, which cost the whole
+  call and is now banned from the frame by a check, not by judgement; and a refusal phrased that
+  way (no `Unknown name "…"`) parsed as nothing, so the retry resent the same frame until the
+  9-second deadline turned a config bug into *"a blocked wss://: a corporate proxy"*. The
+  classifier now decides from whether the endpoint ever answered during the run — a proxy cannot
+  write a Google error message — and the wire text is logged with the frame that earned it
+  (`#2 frame → … · generationConfig: … · retired: …`), so one screenshot is a complete report.
+  A refusal is remembered against the row that made it, for a week, and `Clear` on the log is
+  the undo.
 - **One failure, one sentence, one box.** A dead call used to print the API's prose in red
   monospace — ten lines of `Unknown name "responseModalities" at 'setup': Cannot find field.`,
   twice, on a 6-inch screen, which is a log file where a phone call should be. Now the headline

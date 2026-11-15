@@ -1121,21 +1121,23 @@ function sendAudio(int16) {
 }
 
 /**
- * The setup frame, in one place, for both the call and the audition.
- *
- * Two rules the Live API enforces silently, so they are encoded here:
- *  - generation config lives under `setup.generationConfig`. Sent flat on `setup`,
- *    `speechConfig` is an unknown field: the call connects, the model speaks, and the
- *    voice you picked is dropped. The worst failure there is, because it looks applied.
- *  - anything a row may not know must be gated on the row. An unknown field is a
- *    rejected setup — a dead 1006, indistinguishable from a bad key — so the newer,
- *    richer fields (transcription biasing, resumption, always-answer) only go to rows
- *    that document them.
- */
-/**
  * Which half of the setup frame a field belongs to.
  *
- * `BidiGenerateContentSetup` is one proto with two levels: the generation knobs go under
+ * The setup frame is built here, in one place, for both the call and the audition, because the
+ * API enforces two rules with no warning of their own:
+ *  - generation config lives under `setup.generationConfig`. Sent flat on `setup`, `speechConfig`
+ *    is an unknown field: the call connects, the model speaks, and the voice you picked is
+ *    dropped. The worst failure there is, because it looks applied.
+ *  - a field the endpoint does not accept on *this* row is not ignored either: the whole setup is
+ *    refused, so the call is dead — a 1007 whose reason is a protobuf sentence, indistinguishable
+ *    from a bad key from the outside. Gating the newer fields on the row name was the first
+ *    answer and it was not enough: `word_timestamp` is declared in google-genai's
+ *    AudioTranscriptionConfig and the endpoint still refused it, which is how a caption feature
+ *    cost a user their call. So anything optional that survives the gate has to be retireable
+ *    mid-flight (see `unknownFieldOf`), and is remembered as refused per row rather than
+ *    rediscovered on every dial.
+ *
+ * `BidiGenerateContentSetup` itself is one proto with two levels: the generation knobs go under
  * `generationConfig`, everything else sits flat on `setup`. Both the docs and the SDK's own
  * converters agree on this split, and getting it wrong is not a warning — the endpoint answers
  * with a 1007 close whose reason is `Unknown name "responseModalities" at 'setup': Cannot find
@@ -1183,15 +1185,97 @@ let refused = new Set();
 let refusedFor = '';
 let fieldRepairs = 0;
 const MAX_FIELD_REPAIRS = 3;
+const REFUSED_KEY = 'aryans-aicall/refused';
+// A refusal is a fact about this build, this row and today's endpoint, so it is kept for a week
+// and then believed again. Google moves Live fields in both directions — adds them, takes them
+// back — and a memory that never expires turns a temporary "not supported" into a permanently
+// handicapped call that nobody knows how to undo.
+const REFUSED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // A move is tried once per field. If a field is still refused after being nested where it
 // belongs, escalating to dropping it is the only honest step left — and repeating the same
-// repair would be a retry loop wearing a ladder's clothes.
+// repair would be a retry loop wearing a ladder's clothes. Declared here, above the reset
+// helpers that clear it, so no code path can reach `movedAway` before it exists.
 const movedAway = new Set();
 
+/**
+ * Point the retirement set at the current row, loading what this row refused before.
+ *
+ * Without this, every call on a row that lacks a field spends a socket and ~1 s rediscovering
+ * it, which is one refused frame and one "Fixing the setup frame…" note per call — noise on a
+ * call that works, and indistinguishable from a flaky one.
+ */
+function syncRefusedToRow() {
+  if (refusedFor === cfg.model) return;
+  refusedFor = cfg.model;
+  refused.clear();
+  movedAway.clear();
+  fieldRepairs = 0;
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(REFUSED_KEY) || 'null'); } catch {}
+  if (!saved || saved.model !== cfg.model) return;
+  if (Date.now() - Number(saved.at || 0) > REFUSED_TTL_MS) return;
+  for (const key of Array.isArray(saved.keys) ? saved.keys : []) refused.add(String(key));
+}
+
+function rememberRefusal(key) {
+  refused.add(key);
+  try {
+    localStorage.setItem(REFUSED_KEY, JSON.stringify({ model: cfg.model, keys: [...refused], at: Date.now() }));
+  } catch {}
+}
+
+/** The user's undo, wired to Clear on the technical log. */
+function forgetRefusals() {
+  refused.clear();
+  movedAway.clear();
+  fieldRepairs = 0;
+  try { localStorage.removeItem(REFUSED_KEY); } catch {}
+}
+
 /** `Unknown name "X" at 'setup.generationConfig': Cannot find field.` → { field, path }. */
+/** `word_timestamp` on the wire, `wordTimestamp` in the JSON we sent. Both are the same key. */
+const camelCase = (name) => String(name).replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
+const camelPath = (path) => String(path).split('.').map(camelCase).join('.');
+
+/** Where in the frame we actually sent does this key live? Refusals often do not say. */
+function locateField(field, node, path, depth) {
+  if (!node || typeof node !== 'object' || depth > 3) return '';
+  for (const key of Object.keys(node)) {
+    if (key === field) return path;
+    const val = node[key];
+    if (val && typeof val === 'object' && !Array.isArray(val)) {
+      const hit = locateField(field, val, `${path}.${key}`, depth + 1);
+      if (hit) return hit;
+    }
+  }
+  return '';
+}
+
+/**
+ * Which field a refusal is about, and where it lives.
+ *
+ * Two shapes, both seen on real devices, and the second one used to be invisible to this app:
+ *   `Unknown name "responseModalities" at 'setup': Cannot find field.`
+ *   `word_timestamp is not supported in BidiGenerateContent.`
+ * The first names its container; the second does not, quotes the proto's snake_case, and puts
+ * the name *before* the phrase instead of in quotes. A ladder that parses only the first leaves
+ * the user holding the dead call the second describes — which is exactly what happened, with
+ * the same frame resent until the handshake deadline turned a config bug into "check your
+ * proxy". So: normalise the name, and locate it in the frame that was actually sent.
+ */
 function unknownFieldOf(msg) {
-  const m = /Unknown name "([A-Za-z_][\w.]*)"(?:\s+at '([\w.]*)')?/.exec(String(msg || ''));
-  return m ? { field: m[1], path: m[2] || 'setup' } : null;
+  const raw = String(msg || '');
+  let m = /Unknown name "([A-Za-z_][\w.]*)"(?:\s+at '([\w.]*)')?/.exec(raw);
+  if (!m) m = /(?:^|[\s"'])([A-Za-z_][A-Za-z0-9_.]*)\s+is\s+not\s+supported/i.exec(raw);
+  if (!m) m = /(?:Unsupported|unknown|invalid)\s+(?:value\s+for\s+)?(?:field|name)\s*[:=]?\s*"?'?([A-Za-z_][\w.]*)/i.exec(raw);
+  if (!m) return null;
+  // The container is normalised too. The server quotes proto paths in snake_case
+  // (`setup.input_audio_transcription`) while the frame on this side is camelCase JSON, and a
+  // retirement keyed on the wire spelling deletes nothing — the refusal would then be
+  // remembered, the field resent, and the loop is back.
+  const field = camelCase(m[1].split('.').pop());
+  const said = m[2] ? camelPath(m[2]) : '';
+  return { field, path: said || locateField(field, lastSetupSent, 'setup', 0) || 'setup' };
 }
 
 const refusalKey = (info) => `${info.path || 'setup'}.${info.field}`;
@@ -1230,7 +1314,8 @@ function nestGenerationFields(setup) {
  * "stop trying", which is exactly where a user gives up on a voice app.
  */
 function stripRefused(setup) {
-  if (refusedFor !== cfg.model || refused.size === 0) return setup;
+  syncRefusedToRow();
+  if (refused.size === 0) return setup;
   for (const key of refused) {
     const segs = key.split('.');
     if (segs.shift() !== 'setup' || segs.length === 0) continue;
@@ -1250,20 +1335,20 @@ function stripRefused(setup) {
  * their settings get thrown away whenever Google renames something.
  */
 function repairField(info, raw) {
-  if (refusedFor !== cfg.model) { refusedFor = cfg.model; refused.clear(); fieldRepairs = 0; movedAway.clear(); }
+  syncRefusedToRow();
   const key = refusalKey(info);
   let said;
   if (info.path === 'setup' && GENERATION_FIELDS.has(info.field) && !movedAway.has(info.field)) {
     movedAway.add(info.field);
     said = `"${info.field}" belongs under generationConfig, not flat on setup. Moved it there — nothing you set in ⚙ is being dropped.`;
   } else {
-    refused.add(key);
+    rememberRefusal(key);
     if (info.path === 'setup' && GENERATION_FIELDS.has(info.field)) {
       // The move was tried and the field was refused at `setup` again, which means the two
       // locations are being read as one by something that disagrees with us. Stripping only
       // the path named in the error would produce a byte-identical next frame — a retry loop
       // that cannot terminate. Retire the field everywhere it could live.
-      refused.add(`setup.generationConfig.${info.field}`);
+      rememberRefusal(`setup.generationConfig.${info.field}`);
     }
     said = `This row does not accept "${info.field}" at ${info.path}. That one field is off for this row; voice, VAD and captions stay exactly as you set them.`;
   }
@@ -1271,9 +1356,13 @@ function repairField(info, raw) {
   return said;
 }
 
+/** The most recently built setup frame, so a refusal with no path can still be located. */
+let lastSetupSent = null;
+
 const liveSetup = (setup) => {
   const frame = stripRefused(nestGenerationFields(setup));
   auditSetup(frame);
+  lastSetupSent = frame;
   return { setup: frame };
 };
 
@@ -1334,16 +1423,16 @@ function fullSetup() {
     // call. Biasing is free, adds no latency, and is not a guess at the sentence —
     // it only lifts the terms the ASR was already close to.
     setup.inputAudioTranscription.customVocabulary = CUSTOM_VOCAB;
-    // Captions with positions. The field is `wordTimestamp` in AudioTranscriptionConfig
-    // — `enableWordTimestamps` reads like it and is not — and an unknown name here
-    // rejects the whole setup, which is a dead socket blamed on the key. Worth the risk
-    // because a transcript is the artifact of a call: "2:14 pe bola tha" is checkable,
-    // "woh bola tha" is not.
-    setup.outputAudioTranscription.wordTimestamp = true;
-    setup.inputAudioTranscription.wordTimestamp = true;
-    // Do NOT "improve" this later by adding `mode: 'SMART'` (disfluency removal, tidier
-    // Hinglish): SMART and timestamps are mutually exclusive in the API, and a setup that
-    // asks for both is rejected outright — a dead socket, blamed on the key.
+    // NO word timestamps, and do not add them back because a client library declares them.
+    // google-genai's AudioTranscriptionConfig has `word_timestamp`, so this file asked for it
+    // — and a phone at 02:48 got:
+    //     socket closed with code 1007: word_timestamp is not supported in BidiGenerateContent.
+    // That is not a caption downgrade, it is a dead call: the *whole* setup is refused, so
+    // nothing streams, and the retry sent the same frame. Presence in an SDK type is a claim
+    // about the library, not about the wire. `mode: 'SMART'` stays out for the same reason —
+    // tidier Hinglish is worth nothing when the alternative is a call that connects.
+    // Anything that *is* sent here and turns out to be unsupported gets retired by the repair
+    // ladder, which now understands this phrasing too, and remembered per row.
     // Ask for a resumption handle so a dropped line or the session cap costs the
     // caller nothing: the next socket reattaches to this conversation instead of
     // starting one where the caller has to say "maine kaha tha" all over again.
@@ -1410,9 +1499,18 @@ function openCallSocket(reason) {
     return false;
   }
   armHandshake();
-  ws.onopen = () => send(triedMinimal ? minimalSetup() : fullSetup());
-  ws.onmessage = onMessage;
+  connectAttempt++;
+  ws.onopen = () => {
+    const frame = triedMinimal ? minimalSetup() : fullSetup();
+    logFrame(frame);
+    send(frame);
+  };
+  // Any inbound frame at all is proof the endpoint answered, which is what separates "your
+  // network" from "this config" below. A close that carries a *reason* is the same proof —
+  // Google writes the refusal there, a proxy cannot.
+  ws.onmessage = (ev) => { sawAnswer = true; onMessage(ev); };
   ws.onclose = (e) => {
+    if (e && e.reason) sawAnswer = true;
     if (rotating) return; // we closed this one on purpose, mid-call
     if (!settled) {
       failHandshake(`socket closed${e.code ? ` with code ${e.code}` : ''}${e.reason ? `: ${e.reason}` : ''}`);
@@ -1440,6 +1538,30 @@ function detachSocket(sock) {
 let rotating = false;
 let goAwayTimer = null;
 let sessionHandle = '';
+// Which connect this is, so a failure run's log lines read in order, and whether the endpoint
+// ever answered during it. Both exist because a phone screenshot showed
+// `word_timestamp is not supported in BidiGenerateContent` and then blamed a corporate proxy:
+// the answer was already in hand and the diagnosis threw it away.
+let connectAttempt = 0;
+let sawAnswer = false;
+
+/**
+ * One log line naming what the frame actually carried.
+ *
+ * The device reported the refusal and nothing about the request that earned it, so the cause had
+ * to be reasoned out from the source. This line makes one screenshot a complete report: the row,
+ * the generation knobs, the optional setup fields, and what has already been retired.
+ */
+function logFrame(frame) {
+  const st = (frame && frame.setup) || {};
+  const gen = Object.keys(st.generationConfig || {}).join(', ') || '—';
+  const bits = Object.keys(st).filter((k) => k !== 'model' && k !== 'generationConfig').join(', ') || '—';
+  logLine(`#${connectAttempt} frame → ${shortModel(st.model)}`
+    + ` · generationConfig: ${gen}`
+    + ` · setup: ${bits}`
+    + ` · retired: ${refused.size ? [...refused].join(', ') : 'none'}`
+    + ` · caps: ${cfg.caps}${triedMinimal ? ' · MINIMAL frame' : ''}`);
+}
 
 /**
  * Google ends a Live session on a schedule, not on request: `goAway` says when, and
@@ -1936,13 +2058,16 @@ async function failHandshake(tag) {
   setMode('connecting', 'connecting');
   el.say.textContent = 'Not connected — checking what your key can see…';
   const info = await refreshModels(true);
-  let why = `Could not connect (${tag}).`;
+  // `tag` is never pasted into the sentence — it is the raw wire text, and it belongs in the log
+  // and under the fold. `Could not connect (socket closed with code 1007: word_timestamp is not
+  // supported in BidiGenerateContent.)` was a 260-character red paragraph on a 6-inch screen.
+  let why = 'Could not connect.';
   let one = '';
   let swapped = false;
   if (info?.error) {
     why = info.error;
   } else if (info && !info.ok && info.best && info.best !== qualify(cfg.model)) {
-    why += ` "${shortModel(cfg.model)}" is not a row this key can see.`;
+    why = `"${shortModel(cfg.model)}" is not a row this key can see.`;
     one = `Retrying with "${shortModel(info.best)}".`;
     pendingModelFix = info.best;
     cfg.model = info.best;
@@ -1950,14 +2075,20 @@ async function failHandshake(tag) {
   } else if (info) {
     // Two different failures look identical from here and are not: silence (nothing came back,
     // which is what a blocked socket looks like) and an answer we did not like (which no proxy
-    // can produce — it got through). Saying "or a proxy, or the frame" covers both and fixes
-    // neither, so pick by what actually arrived.
-    why += /no setupComplete|never opened|closed before it opened/i.test(tag)
-      ? ' Nothing came back at all, which is a blocked wss://: a corporate proxy, an extension, or an embedder without the right policy.'
-      : ' The row is fine and the endpoint answered, so it is the setup frame it refused. Nothing about your network is implicated.';
-    one = fieldRepairs >= MAX_FIELD_REPAIRS
-      ? 'Retrying with the minimal setup frame — voice and VAD fall back to defaults, and everything else about this call still works.'
-      : `Repairing one field at a time first (${fieldRepairs}/${MAX_FIELD_REPAIRS} used), so the voice you picked survives.`;
+    // can produce — it got through). Decide on what arrived during the *whole* run, not on the
+    // shape of the last tag: a 9 s deadline on attempt two says nothing about attempt one, and
+    // attempt one is where the refusal was written.
+    const answered = sawAnswer || /is not supported|Unknown name|1007|Invalid JSON/i.test(tag);
+    why += answered
+      ? ' Google answered and refused the request, so the key and the network both got through — this is the setup config.'
+      : ' Nothing came back at all, which is a blocked wss://: a corporate proxy, an extension, or an embedder without the right policy.';
+    // And never promise a repair that is not available: "(0/3 used), so the voice you picked
+    // survives" was printed on a path that had no field name to work from and changed nothing.
+    one = bad
+      ? `Retrying without "${bad.field}".`
+      : fieldRepairs >= MAX_FIELD_REPAIRS
+        ? 'Retrying with the minimal setup frame — voice and VAD fall back to defaults, and everything else about this call still works.'
+        : 'Retrying with the plain setup frame — voice and pause detection take that row’s defaults.';
   } else {
     why += ' Nothing to probe from here: no key on this page and no server route.';
     one = 'Paste a key in Settings, then Start again.';
@@ -2458,6 +2589,11 @@ $('sheetTest').addEventListener('click', async () => {
 
 if (el.logCopy) el.logCopy.addEventListener('click', () => { copyLog(); });
 if (el.logClear) el.logClear.addEventListener('click', () => {
+  // Clearing the log also forgets what this row was seen to refuse. It is the only discoverable
+  // undo for the case where the endpoint starts supporting a field again, or a refusal was
+  // misread: "the call works but something I set is being dropped" needs a way back that does
+  // not involve devtools.
+  forgetRefusals();
   el.sheetLog.textContent = '';
   logLines = 0;
   el.sheetLog.setAttribute('data-lines', '0');

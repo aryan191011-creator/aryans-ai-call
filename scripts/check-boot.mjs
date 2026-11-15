@@ -124,6 +124,13 @@ const store = new Map();
 const localStorage = {
   getItem: (k) => (store.has(k) ? store.get(k) : null),
   setItem: (k, v) => store.set(k, String(v)),
+  // A stub that omits a real method is not a stub, it is a missing requirement: the app wraps
+  // `removeItem` in try/catch for quota-hardened browsers, so without it here every "forgot it"
+  // assertion would be testing the catch block instead of the forgetting.
+  removeItem: (k) => store.delete(k),
+  key: (i) => [...store.keys()][i] ?? null,
+  get length() { return store.size; },
+  clear: () => store.clear(),
 };
 
 // ── stub WebAudio (48 kHz context, buffers declared at 24 kHz) ─────────────
@@ -1599,15 +1606,26 @@ const setModel = async (m, caps) => {
 };
 
 const sFull = await setModel('models/gemini-3.1-flash-live-preview');
-check('a capable row is asked for word-timed captions, vocabulary and a resumable line', () => {
+check('a capable row is asked for vocabulary and a resumable line — and not for word timestamps', () => {
   const setup = sFull.frames('setup')[0].setup;
   const vocab = setup.inputAudioTranscription.customVocabulary;
   assert.ok(Array.isArray(vocab) && vocab.length, 'no vocabulary biasing on a row that supports it');
   assert.ok(vocab.length <= 100, 'Google reports best results at <=100 terms, got ' + vocab.length);
   assert.ok(vocab.includes('WhatsApp') && vocab.includes('OTP'),
     'the words an Indian phone call actually contains are missing');
-  assert.equal(setup.outputAudioTranscription.wordTimestamp, true,
-    'captions cannot be timed without word timestamps');
+  // This check used to assert `wordTimestamp === true`, with the message "captions cannot be
+  // timed without word timestamps". A phone answered that frame with
+  //   socket closed with code 1007: word_timestamp is not supported in BidiGenerateContent.
+  // which is not a caption downgrade but a dead call — the whole setup is refused. The field is
+  // in google-genai's AudioTranscriptionConfig, so the type system could not help; only the
+  // endpoint can, and it said no. Captions stay (un-timed), timestamps do not come back.
+  for (const side of ['inputAudioTranscription', 'outputAudioTranscription']) {
+    for (const banned of ['wordTimestamp', 'enableWordTimestamps']) {
+      assert.equal(setup[side]?.[banned], undefined, `${side}.${banned} is a refused field, not a feature`);
+    }
+  }
+  assert.ok(setup.inputAudioTranscription && setup.outputAudioTranscription,
+    'captions themselves were thrown out with the timestamps');
   assert.ok(setup.sessionResumption, 'no resumption requested — a drop costs the whole call');
   assert.equal(setup.proactivity, undefined,
     'proactivity is not supported on this row: sending it is how the socket dies');
@@ -2187,6 +2205,49 @@ check('every setup key path the app can emit is one the SDK emits', () => {
     'wordTimestamp is the name; enableWordTimestamps reads like it and is not');
 });
 
+/**
+ * Fields the endpoint refuses even though a client library declares them. Being in
+ * google-genai's `AudioTranscriptionConfig` is a claim about the library; the wire answer was
+ * `word_timestamp is not supported in BidiGenerateContent`, i.e. a dead call. Asserted against
+ * the frames, not the source text — a grep for a field name trips on every comment that explains
+ * why the field is gone, which is a check that fails for the wrong reason and gets loosened.
+ */
+const BANNED_IN_ANY_FRAME = [
+  'setup.inputAudioTranscription.wordTimestamp',
+  'setup.outputAudioTranscription.wordTimestamp',
+  'setup.inputAudioTranscription.mode',
+  'setup.outputAudioTranscription.mode',
+];
+
+check('no frame this build can emit asks for a field the endpoint refuses', () => {
+  const hits = [];
+  const walk = (node, path, tag) => {
+    if (!node || typeof node !== 'object') return;
+    for (const key of Object.keys(node)) {
+      const full = `${path}.${key}`;
+      if (BANNED_IN_ANY_FRAME.includes(full)) hits.push(`${tag}: ${full}`);
+      walk(node[key], full, tag);
+    }
+  };
+  for (const [i, sock] of sockets.entries()) {
+    for (const f of sock.frames('setup')) walk(f.setup, 'setup', `socket #${i + 1}`);
+  }
+  // Every toggle combination, through the app's own builder — the sent frames only cover the one
+  // configuration the boot scenario ran in, and `wordTimestamp` used to be gated on the row.
+  for (const caps of ['full', 'lean']) for (const vad of ['auto', 'ptt']) for (const model of ['models/gemini-3.1-flash-live-preview', 'models/gemini-2.5-flash-native-audio-preview-08-2025']) {
+    const frame = vm.runInContext(
+      `(() => { const was = { caps: cfg.caps, vad: cfg.vad, model: cfg.model };
+        cfg.caps = '${caps}'; cfg.vad = '${vad}'; cfg.model = '${model}';
+        const out = JSON.stringify(fullSetup().setup); Object.assign(cfg, was); return out; })()`,
+      sandbox,
+    );
+    walk(JSON.parse(frame), 'setup', `${caps}/${vad}/${model.slice(7, 15)}`);
+  }
+  assert.deepEqual(hits, [], 'refused fields in a setup frame: ' + hits.join(', '));
+  assert.ok(sockets.length > 1 && BANNED_IN_ANY_FRAME.length >= 4,
+    'the ban list is what this check is; if it is empty the check is decorative');
+});
+
 check('no setup frame in the whole suite ever puts a generation field flat', () => {
   // The real assertion: walk every frame the page actually sent, not the source text.
   // Regex over source is what failed here last time — it can only find what you think to
@@ -2496,12 +2557,178 @@ check('one field gets one repair, and the ladder is capped', () => {
   const cap = Number(/const MAX_FIELD_REPAIRS = (\d+);/.exec(app)[1]);
   assert.ok(cap >= 2 && cap <= 6, `a repair cap of ${cap} is either a loop or a dead end`);
   const strip = /function stripRefused\([\s\S]*?\n\}/.exec(app)[0];
-  assert.match(strip, /refusedFor !== cfg\.model/,
-    'a field refused by one row must not be muted for every row forever');
+  const sync = /function syncRefusedToRow\(\)\ \{([\s\S]*?)\n\}/.exec(app);
+  assert.ok(sync, 'the retirement set is no longer scoped to a row anywhere — a refusal on one '
+    + 'row would mute that field on every row forever');
+  assert.match(sync[1], /refusedFor === cfg\.model/, 'syncRefusedToRow does not compare rows');
+  assert.match(strip, /syncRefusedToRow\(\)/, 'stripRefused reads the set without pointing it at this row');
   assert.match(strip, /for \(const seg of segs\)/,
     'stripRefused only knows two depths again, so a nested refusal is remembered but re-sent');
   const repair = /function repairField\([\s\S]*?\n\}/.exec(app)[0];
   assert.match(repair, /movedAway/, 'the move is unbounded: move, refuse, move again, forever');
+});
+
+/* ══ the device log, verbatim: 02:48 ══════════════════════════════════════════
+ * The phone that survived the last fix reported:
+ *     [02:48:16] socket closed with code 1007: word_timestamp is not supported in BidiGenerateContent.
+ *     [02:48:27] no setupComplete within 9s
+ * and the UI called that "a blocked wss://: a corporate proxy". Two defects, both now pinned:
+ * the refusal phrasing was unparsed (so nothing was repaired), and the diagnosis was chosen from
+ * the last tag instead of from whether the endpoint ever answered.
+ */
+// The ladder's counters live for the whole page load and four scenarios now touch them, so each
+// one states its starting state rather than inheriting one. Writing to internals from a test is
+// poking; depending on execution order to land on the same values is worse, and it is how a
+// green suite and a red one differed by a `settle()` a hundred lines earlier.
+const resetLadder = (model) => {
+  vm.runInContext(`(() => {
+    fieldRepairs = 0; sawAnswer = false; handshakeTries = 0; triedMinimal = false;
+    refused.clear(); movedAway.clear(); refusedFor = '';
+    cfg.model = '${model}';
+    localStorage.removeItem('aryans-aicall/refused');
+  })()`, sandbox);
+  localStorage.removeItem('aryans-aicall/refused');
+};
+const GOODROW = 'models/gemini-3.8-live';
+
+const openBrokenCall = async (model) => {
+  await endEverything();
+  resetLadder(model || GOODROW);
+  reg.get('pttBtn').fire('click');
+  await settle(80);
+  return sockets.at(-1);
+};
+
+const sWord = await openBrokenCall();
+sWord.from({});   // any inbound frame: the endpoint answered, however briefly
+sWord.onclose({ code: 1007, reason: 'word_timestamp is not supported in BidiGenerateContent.' });
+await settle();
+
+check('a refusal in the endpoint’s other phrasing is still parsed and still repaired', () => {
+  const t = threadText();
+  assert.match(t, /does not accept "wordTimestamp"/,
+    'the second wire phrasing was invisible to the ladder, which is what cost the call: ' + JSON.stringify(t.slice(-260)));
+  const next = sockets.at(-1);
+  assert.notEqual(next, sWord, 'no retry after a parsed refusal');
+  const setup = next.frames('setup')[0].setup;
+  assert.ok(setup.generationConfig?.speechConfig, 'an unparseable-in-detail refusal pulled the sledgehammer again');
+  assert.ok(setup.systemInstruction, 'the persona went with it');
+  assert.equal(setup.inputAudioTranscription?.wordTimestamp, undefined);
+  assert.doesNotMatch(t, /corporate proxy/, 'a refusal the endpoint *answered* was blamed on the network');
+});
+
+check('the log records the frame, so one screenshot is a complete report', () => {
+  const log = String(reg.get('sheetLog').textContent);
+  const line = /#\d+ frame → [^\n]*/.exec(log);
+  assert.ok(line, 'no frame line in the technical log: ' + JSON.stringify(log.slice(-200)));
+  assert.match(line[0], /generationConfig: .*responseModalities/, 'the frame line does not name the knobs: ' + line[0]);
+  assert.match(line[0], /setup: .*systemInstruction/, 'the frame line does not name the setup fields: ' + line[0]);
+  assert.match(line[0], /retired: /, 'the frame line does not say what was already dropped: ' + line[0]);
+});
+
+check('the refusal is remembered per row, and only for that row', () => {
+  // `read` takes an expression whose value is already JSON *text*: an object handed back out of
+  // the context is a foreign-realm one, and JSON.parse on it stringifies to "[object Object]".
+  const read = (expr) => JSON.parse(vm.runInContext(expr, sandbox));
+  const stored = read(`localStorage.getItem('aryans-aicall/refused') || 'null'`);
+  assert.ok(stored, 'a refusal was repaired without being remembered — the next call pays for it again');
+  assert.equal(stored.model, GOODROW, 'remembered against the wrong row');
+  assert.ok(stored.keys.includes('setup.wordTimestamp'), 'the retired key is not what was recorded: ' + JSON.stringify(stored.keys));
+  assert.ok(Array.isArray(stored.keys) && stored.keys.length <= 12, 'the retirement list is unbounded');
+
+  // Same frame, different row: the field must come back, because another row may accept it.
+  const other = read(`(() => {
+    cfg.model = 'models/gemini-9.9-live'; refusedFor = '';
+    return JSON.stringify(stripRefused({ model: cfg.model, wordTimestamp: true }));
+  })()`);
+  assert.equal(other.wordTimestamp, true, 'a refusal on one row muted the field on every row forever');
+
+  const back = read(`(() => {
+    cfg.model = '${GOODROW}'; refusedFor = '';
+    return JSON.stringify(stripRefused({ model: cfg.model, wordTimestamp: true }));
+  })()`);
+  assert.equal(back.wordTimestamp, undefined, 'the stored refusal was not reloaded when the row came back');
+
+  // And it expires: a refusal is a fact about today's endpoint, not a permanent verdict.
+  // Same row, aged entry: the model guard has to pass for the expiry to be the thing under test.
+  // The first draft switched rows here too, so the assertion held for a reason that had nothing
+  // to do with TTL and the check passed with the expiry deleted.
+  const aged = read(`JSON.stringify((() => {
+    const saved = JSON.parse(localStorage.getItem('aryans-aicall/refused'));
+    saved.at = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    localStorage.setItem('aryans-aicall/refused', JSON.stringify(saved));
+    cfg.model = '${GOODROW}'; refusedFor = '';
+    return stripRefused({ model: cfg.model, wordTimestamp: true });
+  })())`);
+  assert.equal(aged.wordTimestamp, true, 'a week-old refusal still mutes a field; the endpoint may have learned it since');
+  vm.runInContext(`cfg.model = '${GOODROW}'; refusedFor = '';`, sandbox);
+});
+
+check('Clear on the log is also the undo for a retired field', () => {
+  reg.get('logClear').fire('click');
+  assert.equal(localStorage.getItem('aryans-aicall/refused'), null, 'Clear left the memory in place');
+  const after = JSON.parse(vm.runInContext(`(() => refused.has('setup.wordTimestamp') ? JSON.stringify(1) : JSON.stringify(0))()`, sandbox));
+  assert.equal(after, 0, 'the in-memory set survived the button that exists to reset it');
+});
+
+/* ── the classifier, both ways ─────────────────────────────────────────── */
+const sAnswered = await openBrokenCall();
+sAnswered.from({});
+sAnswered.onclose({ code: 1006, reason: '' });
+await settle();
+const answeredText = threadText().slice(-420);
+
+check('an answer that arrived is never diagnosed as a blocked network', () => {
+  assert.match(answeredText, /Google answered and refused/, 'no verdict for the answered case: ' + JSON.stringify(answeredText.slice(0, 160)));
+  assert.doesNotMatch(answeredText, /corporate proxy|blocked wss/, 'the proxy sentence is back on an answered failure');
+  // And the promise has to match what the code can do: no field was named, so no
+  // field-by-field repair is available. "(0/3 used), so the voice you picked survives" was a
+  // reassurance about a path that was not taken.
+  assert.doesNotMatch(answeredText, /one field at a time/, 'promised a repair it could not perform');
+  assert.match(answeredText, /plain setup frame|minimal setup frame/, 'no next step offered: ' + JSON.stringify(answeredText.slice(-200)));
+});
+
+const sSilent = await openBrokenCall();
+sSilent.onclose({ code: 1006, reason: '' });
+await settle();
+
+check('real silence is still called silence', () => {
+  const t = threadText().slice(-420);
+  assert.match(t, /blocked wss|Nothing came back/, 'the network case lost its sentence: ' + JSON.stringify(t.slice(0, 160)));
+});
+
+// A refusal the ladder has already retired, so the long API prose reaches the classifier
+// instead of being answered with another repair. This is the case that printed 130 characters
+// of wire text inside the red box on the phone.
+const WORDY = 'word_timestamp is not supported in BidiGenerateContent. Accepted fields on this '
+  + 'endpoint are responseModalities, speechConfig, temperature, topP, topK, maxOutputTokens, '
+  + 'seed, and the endpoint suggests removing unknown keys before retrying the setup frame.';
+{
+  const sLong = await openBrokenCall();
+  vm.runInContext(`refusedFor = cfg.model; refused.add('setup.wordTimestamp');`, sandbox);
+  sLong.from({});
+  sLong.onclose({ code: 1007, reason: WORDY });
+  await settle();
+}
+
+check('a failure sentence stays a sentence, even when the endpoint was wordy', () => {
+  // The whole reason the screenshot looked like a crash log: the raw tag was interpolated into
+  // the headline, so `Could not connect (socket closed with code 1007: word_timestamp is not
+  // supported in BidiGenerateContent.)` printed 130 characters of API prose in a red box.
+  const errs = (reg.get('thread').children || []).filter((c) => /(^|\s)err(\s|$)/.test(String(c.className)));
+  assert.ok(errs.length >= 1, 'the wordy refusal produced no error line at all');
+  const last = String(errs.at(-1).textContent || '');
+  assert.ok(last.length < 210, 'the error box is ' + last.length + ' chars: ' + JSON.stringify(last.slice(0, 110)));
+  assert.doesNotMatch(last, /Accepted fields on this endpoint/, 'the endpoint\u2019s whole essay is the visible message again');
+  // The prose is not lost, only placed: it must be in the fold and in the log.
+  const raws = (reg.get('thread').children || []).slice(-3).flatMap((c) => (c.children || []).flatMap((d) => (d.children || []).map((x) => String(x.textContent))));
+  assert.ok(raws.join(' ').includes('Accepted fields on this endpoint')
+    || String(reg.get('sheetLog').textContent).includes('Accepted fields on this endpoint'),
+    'a 250-character refusal vanished instead of being folded: the log is where it belongs');
+  // `.*?` and not a closing backtick: the forbidden line ends `);` + `.` inside the template,
+  // and a pattern with the wrong tail passes on everything — including the mutation it exists
+  // to catch, which is how it survived its first draft.
+  assert.doesNotMatch(app, /let why = `Could not connect \(\$\{tag\}\)/, 'the raw tag is back in the headline');
 });
 
 // A suite that cannot finish must not look like a suite that passed. An early exit —
